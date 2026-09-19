@@ -1,171 +1,535 @@
-# !pip install customtkinter
 import json
 import math
 import os
+from pathlib import Path
+import tempfile
 import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
 
 import customtkinter
-
 import config
 
 FONT_TYPE = config.FONT_TYPE
 
+
+def atomic_json(path, data):
+    """同じフォルダに一時保存してから置換し、書き込み失敗で元データを壊さない。"""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=".cpn-", suffix=".tmp", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+class ProjectStore:
+    """Explorerの順序・階層と、PJフォルダ内のJSONを管理する。"""
+
+    def __init__(self, roots=None, path=None):
+        self.roots = roots if roots is not None else []
+        self.path = Path(path).resolve() if path else None
+        self.pending = {}  # 新規Projectの、まだディスクへ保存していないファイル
+        self.dirty = False
+
+    def walk(self, nodes=None):
+        for node in self.roots if nodes is None else nodes:
+            yield node
+            yield from self.walk(node.children)
+
+    @staticmethod
+    def validate_name(name):
+        reserved = {"CON", "PRN", "AUX", "NUL"}
+        reserved.update(f"{prefix}{i}" for prefix in ("COM", "LPT") for i in range(1, 10))
+        if (not isinstance(name, str) or not name or name in (".", "..")
+                or name[-1:] in (" ", ".")
+                or any(c in name for c in '/\\<>:"|?*')
+                or any(ord(c) < 32 for c in name)
+                or name.split(".")[0].upper() in reserved):
+            raise ValueError("使用できない名前です。パス区切り文字などは含めないでください。")
+
+    def relative_path(self, node):
+        parts = []
+        current = node
+        while current is not None:
+            self.validate_name(current.text)
+            name = current.text
+            if current.is_file and not name.lower().endswith(".json"):
+                name += ".json"
+            parts.append(name)
+            current = current.parent
+        return Path(*reversed(parts))
+
+    def disk_path(self, node):
+        if self.path is None:
+            raise ValueError("先にProjectを保存してください。")
+        result = self.path.parent / self.relative_path(node)
+        # シンボリックリンクを含め、PJフォルダ外への書き込みを許可しない。
+        if not result.resolve().is_relative_to(self.path.parent):
+            raise ValueError("Projectフォルダの外を参照しています。")
+        if any(p.is_symlink() for p in (result, *result.parents) if p != self.path.parent):
+            raise ValueError("シンボリックリンクは扱えません。")
+        if result.resolve() == self.path:
+            raise ValueError("Projectファイルと同じ名前は使用できません。")
+        return result
+
+    def validate(self):
+        seen = set()
+        for node in self.walk():
+            key = self.relative_path(node).as_posix().casefold()
+            if key in seen:
+                raise ValueError(f"同じ場所に同名の項目があります: {node.text}")
+            seen.add(key)
+            if node.is_file and node.children:
+                raise ValueError("ファイルは子を持てません。")
+            if self.path:
+                self.disk_path(node)
+
+    def data(self):
+        def serialize(node):
+            result = node.to_dict()
+            metadata = dict(node.data) if isinstance(node.data, dict) else {}
+            if node.data is not None and not isinstance(node.data, dict):
+                metadata["legacy_data"] = node.data
+            metadata["path"] = self.relative_path(node).as_posix()
+            result["data"] = metadata
+            result["children"] = [serialize(child) for child in node.children]
+            return result
+        return [serialize(node) for node in self.roots]
+
+    @classmethod
+    def load(cls, path):
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+        if not isinstance(data, list):
+            raise ValueError("CPNのルートはツリーの配列である必要があります。")
+        project = cls([TreeNode.from_dict(item) for item in data], path)
+        project.validate()
+        return project
+
+    def read_file(self, node):
+        if node in self.pending:
+            return dict(self.pending[node])
+        with self.disk_path(node).open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+        if not isinstance(payload, dict) or not all(
+            isinstance(payload.get(key), str) for key in ("speaker", "text")
+        ):
+            raise ValueError("JSONには文字列のspeakerとtextが必要です。")
+        return {"speaker": payload["speaker"], "text": payload["text"]}
+
+    def save_file(self, node, payload):
+        if self.path is None:
+            self.pending[node] = dict(payload)
+            self.dirty = True
+        else:
+            atomic_json(self.disk_path(node), payload)
+
+    def save(self, path=None):
+        old_path = self.path
+        self.path = Path(path).resolve() if path else self.path
+        created = []
+        try:
+            self.validate()
+            if self.path is None:
+                raise ValueError("保存先を選択してください。")
+            # 新規ファイルは既存ファイルを上書きしない。
+            for node in self.pending:
+                if self.disk_path(node).exists():
+                    raise FileExistsError(f"保存先に既存ファイルがあります: {self.relative_path(node)}")
+            for node in self.walk():
+                destination = self.disk_path(node)
+                if node.is_directory:
+                    if not destination.exists():
+                        destination.mkdir()
+                        created.append(destination)
+                    elif not destination.is_dir():
+                        raise FileExistsError(f"同名のファイルがあります: {destination.name}")
+                elif node in self.pending:
+                    atomic_json(destination, self.pending[node])
+                    created.append(destination)
+            atomic_json(self.path, self.data())
+        except Exception:
+            for entry in reversed(created):
+                if entry.is_dir():
+                    entry.rmdir()
+                else:
+                    entry.unlink()
+            self.path = old_path
+            raise
+        self.pending.clear()
+        self.dirty = False
+
+    def create(self, parent, name, kind):
+        name = name.strip()
+        self.validate_name(name)
+        if kind == TreeNode.FILE and not name.lower().endswith(".json"):
+            name += ".json"
+        self.validate_name(name)
+        if parent is not None and not parent.is_directory:
+            raise ValueError("ファイルの中に項目は作成できません。")
+        node = TreeNode(name, node_type=kind, parent=parent)
+        siblings = self.roots if parent is None else parent.children
+        siblings.append(node)
+        old_dirty = self.dirty
+        try:
+            self.validate()
+            if self.path and self.disk_path(node).exists():
+                raise FileExistsError("同名のファイルまたはディレクトリが既に存在します。")
+            if node.is_file:
+                self.pending[node] = {"speaker": "", "text": ""}
+            self.dirty = True
+            if self.path:
+                self.save()
+        except Exception:
+            siblings.remove(node)
+            self.pending.pop(node, None)
+            self.dirty = old_dirty
+            raise
+        if parent is not None:
+            parent.expanded = True
+        return node
+
+    def move(self, source, target, position):
+        if target is source or (target and source.is_ancestor_of(target)):
+            return False
+        if position == "root_end":
+            parent = None
+        elif target is None:
+            return False
+        elif position == "inside" and target.is_directory:
+            parent = target
+        elif position in ("before", "after"):
+            parent = target.parent
+        else:
+            return False
+        old_parent = source.parent
+        old_siblings = self.roots if old_parent is None else old_parent.children
+        old_index = old_siblings.index(source)
+        old_path = self.disk_path(source) if self.path else None
+        old_dirty = self.dirty
+        old_siblings.pop(old_index)
+        siblings = self.roots if parent is None else parent.children
+        index = len(siblings) if position in ("inside", "root_end") else siblings.index(target) + (position == "after")
+        siblings.insert(index, source)
+        source.parent = parent
+        moved = False
+        try:
+            self.validate()
+            if self.path:
+                new_path = self.disk_path(source)
+                if old_path != new_path:
+                    if new_path.exists():
+                        raise FileExistsError("移動先に同名のファイルまたはディレクトリがあります。")
+                    old_path.rename(new_path)
+                    moved = True
+                self.save()
+            else:
+                self.dirty = True
+        except Exception:
+            if moved:
+                new_path.rename(old_path)
+            siblings.remove(source)
+            old_siblings.insert(old_index, source)
+            source.parent = old_parent
+            self.dirty = old_dirty
+            raise
+        if parent:
+            parent.expanded = True
+        return True
+
+
 class App(customtkinter.CTk):
+    EXPLORER_WIDTH = 240
+    CONTROL_WIDTH = 140
 
     def __init__(self):
         super().__init__()
-
-        # メンバー変数の設定
+        self.project = ProjectStore()
+        self.current_node = None
+        self.saved_payload = {"speaker": "", "text": ""}
         self.fonts = (FONT_TYPE, 15)
-
-        # フォームのセットアップをする
         self.setup_form()
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def setup_form(self):
-        # CustomTkinter のフォームデザイン設定
-        customtkinter.set_appearance_mode("dark")  # Modes: system (default), light, dark
-        customtkinter.set_default_color_theme("blue")  # Themes: blue (default), dark-blue, green
-
-        # フォームサイズ設定
-        self.geometry("720x480")
-        self.title("Chat Palette NEO")
-
-        # 行方向のマスのレイアウトを設定する。リサイズしたときに一緒に拡大したい行をweight 1に設定。
+        customtkinter.set_appearance_mode("dark")
+        self.geometry("1000x650")
+        self.minsize(760, 400)
         self.grid_rowconfigure(1, weight=1)
-        # 列方向のマスのレイアウトを設定する
         self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, minsize=self.CONTROL_WIDTH + 20)
 
+        self.choosePjFile = ChoosePjFile(self, self.open_project, self.new_project)
+        self.choosePjFile.grid(row=0, column=0, padx=(10, 0), pady=10, sticky="ew")
+        self.url_input = UrlInput(self, self.fonts, self.CONTROL_WIDTH)
+        self.url_input.room_url.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.url_input.room_connect.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
+
+        explorer = customtkinter.CTkFrame(self, width=self.EXPLORER_WIDTH)
+        explorer.grid(row=1, column=0, padx=(10, 0), pady=(0, 10), sticky="nsew")
+        explorer.grid_propagate(False)
+        explorer.grid_columnconfigure(0, weight=1)
+        explorer.grid_rowconfigure(1, weight=1)
+        self.project_button = customtkinter.CTkButton(explorer, text="Project保存", command=self.save_project)
+        self.project_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
         self.tree = DragDropTree(
-            self,
-            on_change=self.tree_changed,
-            on_file_click=self.file_clicked,
-            label_text="Explorer"
+            explorer, on_file_click=self.file_clicked, on_move=self.move_node,
+            on_context_menu=self.context_menu, label_text=""
         )
+        self.tree.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="nsew")
+        self.tree.root_nodes = self.project.roots
 
-        self.tree.grid(
-            row=1,
-            column=0,
-            columnspan=2,
-#            fill="both",
-#            expand=True,
-            padx=20,
-            pady=(20, 10),
-            sticky="ns"
+        # URL入力欄と同じ親・列・余白にして幅を一致させる。
+        self.editor = customtkinter.CTkTextbox(self, font=self.fonts, wrap="word")
+        self.editor.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="nsew")
+        controls = customtkinter.CTkFrame(self, fg_color="transparent", width=self.CONTROL_WIDTH)
+        controls.grid(row=1, column=2, padx=10, pady=(0, 10), sticky="nsew")
+        controls.grid_columnconfigure(0, weight=1)
+        self.speaker = customtkinter.CTkEntry(controls, placeholder_text="話者", width=self.CONTROL_WIDTH, font=self.fonts)
+        self.speaker.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.previous_button = customtkinter.CTkButton(controls, text="前へ", command=lambda: self.navigate(-1), width=self.CONTROL_WIDTH)
+        self.next_button = customtkinter.CTkButton(controls, text="次へ", command=lambda: self.navigate(1), width=self.CONTROL_WIDTH)
+        self.save_button = customtkinter.CTkButton(controls, text="保存", command=self.save_current, width=self.CONTROL_WIDTH)
+        self.send_button = customtkinter.CTkButton(controls, text="送信", command=self.send, width=self.CONTROL_WIDTH)
+        for row, button in enumerate((self.previous_button, self.next_button, self.save_button, self.send_button), 1):
+            button.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        self.current_label = customtkinter.CTkLabel(controls, text="ファイル未選択", wraplength=140, justify="left")
+        self.current_label.grid(row=5, column=0, sticky="ew")
+        self.editor.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
+        self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
+        self.clear_editor()
+
+    def payload(self):
+        return {"speaker": self.speaker.get(), "text": self.editor.get("1.0", "end-1c")}
+
+    def is_dirty(self):
+        return self.current_node is not None and self.payload() != self.saved_payload
+
+    def update_status(self):
+        dirty = self.is_dirty()
+        project_name = self.project.path.name if self.project.path else "新規Project"
+        self.title(f"{'* ' if dirty else ''}Chat Palette NEO — {project_name}")
+        self.project_button.configure(text="Project保存" + (" *" if self.project.dirty else ""))
+        if self.current_node:
+            self.current_label.configure(text=f"{self.current_node.text}\n" + ("未保存" if dirty else "保存済み"))
+        files = [n for n in self.project.walk() if n.is_file]
+        index = files.index(self.current_node) if self.current_node in files else -1
+        self.previous_button.configure(state="normal" if index > 0 else "disabled")
+        self.next_button.configure(state="normal" if 0 <= index < len(files) - 1 else "disabled")
+
+    def clear_editor(self):
+        self.current_node = None
+        self.tree.selected_node = None
+        self.editor.configure(state="normal")
+        self.speaker.configure(state="normal")
+        self.editor.delete("1.0", "end")
+        self.speaker.delete(0, "end")
+        self.editor.configure(state="disabled")
+        self.speaker.configure(state="disabled")
+        self.save_button.configure(state="disabled")
+        self.send_button.configure(state="disabled")
+        self.current_label.configure(text="ファイル未選択")
+        self.update_status()
+
+    def confirm_edits(self):
+        if not self.is_dirty():
+            return True
+        answer = messagebox.askyesnocancel(
+            "未保存の変更", f"{self.current_node.text} の変更を保存しますか？\n「いいえ」で破棄します。", parent=self
         )
+        if answer is None:
+            return False
+        return self.save_current() if answer else True
 
-        self.choosePjFile = ChoosePjFile(tree=self.tree, master=self)
-        self.choosePjFile.grid(row=0, column=0, padx=20, pady=20, sticky="ew")
+    def confirm_project(self):
+        if not self.confirm_edits():
+            return False
+        if self.project.dirty:
+            answer = messagebox.askyesnocancel("Project未保存", "Projectを保存しますか？", parent=self)
+            if answer is None:
+                return False
+            if answer and not self.save_project():
+                return False
+        return True
 
-        self.url_input = UrlInput(master=self)
-        self.url_input.grid(row=0, column=1, padx=20, pady=20, sticky="ew")
-
-        
-    def tree_changed(self, data):
-        print(
-            "===== Tree Changed ====="
-        )
-        self.print_tree(
-            self.tree.root_nodes
-        )
+    def report_error(self, error):
+        messagebox.showerror("操作できませんでした", str(error), parent=self)
 
     def file_clicked(self, node):
-        """ファイルを単クリックしたときの処理。"""
-        print(f"ファイルがクリックされました: {node.text}")
-        print(f"data: {node.data}")
-    
-    def print_tree(
-        self,
-        nodes,
-        depth=0
-    ):
-        for node in nodes:
-            print(
-                "    " * depth
-                + "└─ "
-                + node.text
+        if node is self.current_node:
+            return
+        try:
+            payload = self.project.read_file(node)
+        except (OSError, ValueError, TypeError) as error:
+            self.report_error(error)
+            return
+        if not self.confirm_edits():
+            return
+        self.current_node = node
+        self.saved_payload = dict(payload)
+        self.editor.configure(state="normal")
+        self.speaker.configure(state="normal")
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", payload["text"])
+        self.speaker.delete(0, "end")
+        self.speaker.insert(0, payload["speaker"])
+        self.save_button.configure(state="normal")
+        self.send_button.configure(state="normal")
+        self.tree.selected_node = node
+        ancestor = node.parent
+        while ancestor:
+            ancestor.expanded = True
+            ancestor = ancestor.parent
+        self.tree.refresh()
+        self.tree.after_idle(lambda: self.tree.reveal(node))
+        self.update_status()
+
+    def navigate(self, offset):
+        files = [node for node in self.project.walk() if node.is_file]
+        if self.current_node not in files:
+            return
+        index = files.index(self.current_node) + offset
+        if 0 <= index < len(files):
+            self.file_clicked(files[index])
+
+    def save_current(self):
+        if self.current_node is None:
+            return True
+        payload = self.payload()
+        try:
+            if self.project.path is None:
+                # Project保存をキャンセルしたときも編集欄をそのまま保つ。
+                previous = dict(self.project.pending[self.current_node])
+                self.project.save_file(self.current_node, payload)
+                if not self.save_project():
+                    self.project.pending[self.current_node] = previous
+                    return False
+            else:
+                self.project.save_file(self.current_node, payload)
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+            return False
+        self.saved_payload = dict(payload)
+        self.update_status()
+        return True
+
+    def send(self):
+        if self.current_node:
+            print(json.dumps(self.payload(), ensure_ascii=False))
+
+    def save_project(self):
+        path = None
+        if self.project.path is None:
+            path = filedialog.asksaveasfilename(
+                parent=self, title="Projectの保存場所と名前", defaultextension=".cpn",
+                filetypes=[("ChatPaletteNeo Project", "*.cpn")], initialfile="Project.cpn"
             )
-            self.print_tree(
-                node.children,
-                depth + 1
-            )
+            if not path:
+                return False
+        try:
+            self.project.save(path)
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+            return False
+        self.update_status()
+        return True
+
+    def set_project(self, project):
+        self.project = project
+        self.tree.root_nodes = project.roots
+        self.clear_editor()
+        self.tree.refresh()
+
+    def open_project(self):
+        path = filedialog.askopenfilename(parent=self, filetypes=[("ChatPaletteNeo Project", "*.cpn")])
+        if not path:
+            return
+        try:
+            project = ProjectStore.load(path)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.report_error(error)
+            return
+        if self.confirm_project():
+            # 同じProjectを再読み込みする場合も、保存後の内容を使用する。
+            try:
+                project = ProjectStore.load(path)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                self.report_error(error)
+                return
+            self.set_project(project)
+
+    def new_project(self):
+        if self.confirm_project():
+            self.set_project(ProjectStore())
+
+    def close_app(self):
+        if self.confirm_project():
+            self.destroy()
+
+    def move_node(self, source, target, position):
+        try:
+            changed = self.project.move(source, target, position)
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+            return False
+        self.update_status()
+        return changed
+
+    def context_menu(self, node, event):
+        parent = node if node and node.is_directory else (node.parent if node else None)
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="新規ファイル", command=lambda: self.create_node(parent, TreeNode.FILE))
+        menu.add_command(label="新規ディレクトリ", command=lambda: self.create_node(parent, TreeNode.DIRECTORY))
+        if parent:
+            menu.add_separator()
+            menu.add_command(label="ルートに新規ファイル", command=lambda: self.create_node(None, TreeNode.FILE))
+            menu.add_command(label="ルートに新規ディレクトリ", command=lambda: self.create_node(None, TreeNode.DIRECTORY))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def create_node(self, parent, kind):
+        label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
+        name = simpledialog.askstring(f"新規{label}", f"{label}名", parent=self)
+        if name is None:
+            return
+        try:
+            node = self.project.create(parent, name, kind)
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+            return
+        self.tree.refresh()
+        self.update_status()
+        if node.is_file:
+            self.file_clicked(node)
 
 
 class ChoosePjFile(customtkinter.CTkFrame):
-    def __init__(self, tree, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        self.tree = tree
-        self.fonts = (FONT_TYPE, 15)
-        # フォームのセットアップをする
-        self.setup_form()
-
-    def setup_form(self):
-        # 行方向のマスのレイアウトを設定する。リサイズしたときに一緒に拡大したい行をweight 1に設定。
-        self.grid_rowconfigure(1, weight=1)
-        # 列方向のマスのレイアウトを設定する
+    def __init__(self, master, open_project, new_project):
+        super().__init__(master, fg_color="transparent")
         self.grid_columnconfigure(0, weight=1)
-        
-        self.button_select = customtkinter.CTkButton(master=self, 
-            fg_color="transparent", border_width=2, text_color=("gray10", "#DCE4EE"),   # ボタンを白抜きにする
-            command=self.button_select_callback, text="PJファイルを選択", font=self.fonts)
-        self.button_select.grid(row=0, column=0, padx=10, pady=0)
+        customtkinter.CTkButton(self, text="PJファイルを選択", command=open_project, width=145).grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        customtkinter.CTkButton(self, text="新規", command=new_project, width=55).grid(row=0, column=1)
 
-    def button_select_callback(self):
-    # エクスプローラーを表示してファイルを選択する
-        file_name = self.choose_pjfile()
-        
-    def choose_pjfile(self):
-        current_dir = os.path.abspath(os.path.dirname(__file__))
-        file_path = tk.filedialog.askopenfilename(filetypes=[("ChatPaletteNeoProject","*.cpn")],initialdir=current_dir)
 
-        if len(file_path) != 0:
-            self.read_pjfile(file_path)
-        else:
-            # ファイル選択がキャンセルされた場合
-            return None
-
-    def read_pjfile(self, file_path):
-        # ファイルを読み込む処理をここに実装する
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        self.tree.load_data(data)
-        print(f"選択されたファイル: {file_path}")
-
-    def add_item(self,data):
-        for key, value in data.items():
-            for data in value:
-                if type(data) is str:
-                    self.add_item(  key, data)
-                else:
-                    self.add_dir(key, data)
-
-class UrlInput(customtkinter.CTkFrame):
-    def __init__(self, *args, header_name="UrlInput", **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        self.fonts = (FONT_TYPE, 15)
-        self.header_name = header_name
-
-        # フォームのセットアップをする
-        self.setup_form()
-
-    def setup_form(self):
-        # 行方向のマスのレイアウトを設定する。リサイズしたときに一緒に拡大したい行をweight 1に設定。
-        self.grid_rowconfigure(0, weight=1)
-        # 列方向のマスのレイアウトを設定する
-        self.grid_columnconfigure(0, weight=1)
-
-        # ファイルパスを指定するテキストボックス。これだけ拡大したときに、幅が広がるように設定する。
-        self.room_url = customtkinter.CTkEntry(master=self, placeholder_text="CCFoliaのルームURLを入力", width=120, font=self.fonts)
-        self.room_url.grid(row=0, column=0, padx=10, pady=(0,10), sticky="ew")
-
-        self.room_connect = customtkinter.CTkButton(master=self, command=self.room_connect_callback, text="接続", font=self.fonts)
-        self.room_connect.grid(row=0, column=1, padx=10, pady=(0,10))
+class UrlInput:
+    """Appとグリッド列を共有し、編集欄／操作欄の幅を揃える。"""
+    def __init__(self, master, fonts, control_width):
+        self.room_url = customtkinter.CTkEntry(master, placeholder_text="CCFoliaのルームURLを入力", font=fonts)
+        self.room_connect = customtkinter.CTkButton(master, text="接続", command=self.room_connect_callback, width=control_width)
 
     def room_connect_callback(self):
-        # 入力されたURLを取得する
-        room_url = self.room_url.get()
-        print(f"接続ボタンが押されました。入力されたURL: {room_url}")
+        print(f"接続ボタンが押されました。入力されたURL: {self.room_url.get()}")
 
 
 class TreeNode:
@@ -233,7 +597,11 @@ class TreeNode:
 
     @classmethod
     def from_dict(cls, data):
-        children = data.get("children") or []
+        if not isinstance(data, dict) or not isinstance(data.get("text"), str):
+            raise ValueError("ツリー項目には文字列のtextが必要です。")
+        children = data.get("children", [])
+        if not isinstance(children, list):
+            raise ValueError("childrenは配列で指定してください。")
         node_type = data.get("type")
 
         # 旧形式にはtypeがないため、子を持つ項目をディレクトリとして扱う。
@@ -246,7 +614,8 @@ class TreeNode:
             data=data.get("data")
         )
 
-        # 不正なデータでファイルにchildrenが指定されていても階層化しない。
+        if node.is_file and children:
+            raise ValueError("ファイルに子要素が含まれています。")
         if node.is_directory:
             for child_data in children:
                 node.add_child(cls.from_dict(child_data))
@@ -259,6 +628,7 @@ class TreeItem(customtkinter.CTkFrame):
     NORMAL_COLOR = "transparent"
     HOVER_COLOR = ("gray88", "gray24")
     DROP_COLOR = ("#D9EAF7", "#1F4D6D")
+    SELECTED_COLOR = ("#B9D9F5", "#24547A")
 
     def __init__(self, master, tree, node, depth):
         super().__init__(
@@ -273,6 +643,7 @@ class TreeItem(customtkinter.CTkFrame):
         self.depth = depth
         self._hovered = False
         self._drop_inside = False
+        self._hover_job = None
 
         self.grid_columnconfigure(3, weight=1)
 
@@ -328,7 +699,7 @@ class TreeItem(customtkinter.CTkFrame):
             pady=7
         )
 
-        draggable_widgets = [self, self.label, self.drag_handle]
+        draggable_widgets = [self, self.label, self.drag_handle, self.indent]
         if node.is_file:
             draggable_widgets.append(self.icon)
 
@@ -337,9 +708,21 @@ class TreeItem(customtkinter.CTkFrame):
             widget.bind("<B1-Motion>", self.mouse_motion)
             widget.bind("<ButtonRelease-1>", self.mouse_release)
 
-        for widget in (self, self.label, self.drag_handle, self.icon):
+        for widget in (self, self.label, self.drag_handle, self.icon, self.indent):
             widget.bind("<Enter>", self.mouse_enter, add="+")
             widget.bind("<Leave>", self.mouse_leave, add="+")
+            widget.bind("<Button-3>", self.context_menu, add="+")
+        self.update_style()
+
+    def context_menu(self, event):
+        if self.tree.on_context_menu:
+            self.tree.on_context_menu(self.node, event)
+
+    def destroy(self):
+        if self._hover_job is not None:
+            self.after_cancel(self._hover_job)
+            self._hover_job = None
+        super().destroy()
 
     def get_arrow(self):
         if not self.node.children:
@@ -358,9 +741,12 @@ class TreeItem(customtkinter.CTkFrame):
 
     def mouse_leave(self, event=None):
         # 子Widget間の移動ではハイライトがちらつかないよう後で確認する。
-        self.after(10, self.check_hover)
+        if self._hover_job is not None:
+            self.after_cancel(self._hover_job)
+        self._hover_job = self.after(10, self.check_hover)
 
     def check_hover(self):
+        self._hover_job = None
         try:
             pointer_x = self.winfo_pointerx()
             pointer_y = self.winfo_pointery()
@@ -371,7 +757,7 @@ class TreeItem(customtkinter.CTkFrame):
                 and top <= pointer_y <= top + self.winfo_height()
             )
             self.update_style()
-        except Exception:
+        except tk.TclError:
             pass
 
     def update_style(self):
@@ -381,6 +767,8 @@ class TreeItem(customtkinter.CTkFrame):
                 border_width=2,
                 border_color="#3B8ED0"
             )
+        elif self.tree.selected_node is self.node:
+            self.configure(fg_color=self.SELECTED_COLOR, border_width=2, border_color="#3B8ED0")
         elif self._hovered:
             self.configure(fg_color=self.HOVER_COLOR, border_width=0)
         else:
@@ -442,6 +830,8 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         master,
         on_change=None,
         on_file_click=None,
+        on_move=None,
+        on_context_menu=None,
         **kwargs
     ):
         super().__init__(master, **kwargs)
@@ -451,6 +841,11 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         self.item_frames = {}
         self.on_change = on_change
         self.on_file_click = on_file_click
+        self.on_move = on_move
+        self.on_context_menu = on_context_menu
+        self.selected_node = None
+        self.bind("<Button-3>", self.blank_context_menu, add="+")
+        self._parent_canvas.bind("<Button-3>", self.blank_context_menu, add="+")
 
         self.pressed_node = None
         self.press_x = 0
@@ -470,6 +865,24 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
             fg_color="#3B8ED0"
         )
         self.drop_indicator.place_forget()
+
+    def blank_context_menu(self, event):
+        if self.on_context_menu:
+            self.on_context_menu(None, event)
+
+    def reveal(self, node):
+        frame = self.item_frames.get(node)
+        if frame is None:
+            return
+        self.update_idletasks()
+        canvas = self._parent_canvas
+        y = frame.winfo_y()
+        top = canvas.canvasy(0)
+        height = canvas.winfo_height()
+        if y < top:
+            canvas.yview_moveto(y / max(self.winfo_height(), 1))
+        elif y + frame.winfo_height() > top + height:
+            canvas.yview_moveto((y + frame.winfo_height() - height) / max(self.winfo_height(), 1))
 
     def add_root(self, node, index=None):
         self.detach_node(node)
@@ -541,12 +954,16 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
             self.update_drag(node)
 
     def pointer_release(self, node):
-        if self.drag_active:
-            self.finish_drag(node)
-        elif self.pressed_node is node and node.is_file and self.on_file_click:
-            self.on_file_click(node)
-
+        pressed = self.pressed_node
         self.pressed_node = None
+        if self.drag_active:
+            self.update_drag(node)
+            self.finish_drag(node)
+        elif pressed is node and node.is_file and self.on_file_click:
+            frame = self.item_frames.get(node)
+            x, y = self.winfo_pointerxy()
+            if frame and frame.winfo_rootx() <= x < frame.winfo_rootx() + frame.winfo_width() and frame.winfo_rooty() <= y < frame.winfo_rooty() + frame.winfo_height():
+                self.on_file_click(node)
 
     def begin_drag(self, node):
         self.drag_active = True
@@ -563,9 +980,15 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         if self.drag_preview:
             self.drag_preview.move(pointer_x, pointer_y)
 
-        target = self.get_node_under_mouse(pointer_y)
         self.clear_drop_highlights()
         self.hide_drop_indicator()
+        self.hover_node = None
+        self.drop_position = None
+        canvas = self._parent_canvas
+        if not (canvas.winfo_rootx() <= pointer_x < canvas.winfo_rootx() + canvas.winfo_width()
+                and canvas.winfo_rooty() <= pointer_y < canvas.winfo_rooty() + canvas.winfo_height()):
+            return
+        target = self.get_node_under_mouse(pointer_y)
 
         if target is None:
             self.hover_node = None
@@ -619,6 +1042,12 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         self.hover_node = None
         self.drop_position = None
 
+        if self.on_move:
+            if self.on_move(source, target, position):
+                self.refresh()
+                self.call_on_change()
+            return
+
         if position == "root_end":
             self.detach_node(source)
             source.parent = None
@@ -662,7 +1091,8 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
     def get_node_under_mouse(self, pointer_y):
         for node, frame in self.item_frames.items():
             top = frame.winfo_rooty()
-            if top <= pointer_y <= top + frame.winfo_height():
+            # 行間の余白は次の行の「前」として扱う。
+            if pointer_y < top + frame.winfo_height():
                 return node
         return None
 
@@ -725,7 +1155,6 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
     def call_on_change(self):
         if self.on_change:
             self.on_change(self.get_data())
-
 
 
 if __name__ == "__main__":
