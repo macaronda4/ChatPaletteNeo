@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 
 import customtkinter
 import config
@@ -247,6 +247,189 @@ class ProjectStore:
         return True
 
 
+class ModernContextMenu(customtkinter.CTkToplevel):
+    """CustomTkinterの外観に合わせた、軽量な右クリックメニュー。"""
+
+    WIDTH = 230
+
+    def __init__(self, master, title, items, x, y):
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.transient(master)
+        self.configure(fg_color=("#F5F6F8", "#202225"))
+
+        panel = customtkinter.CTkFrame(
+            self,
+            corner_radius=10,
+            border_width=1,
+            border_color=("#D7DADE", "#41454B"),
+            fg_color=("#F5F6F8", "#202225"),
+        )
+        panel.pack(fill="both", expand=True)
+        customtkinter.CTkLabel(
+            panel,
+            text=title,
+            anchor="w",
+            font=(FONT_TYPE, 12),
+            text_color=("#60656D", "#AEB4BC"),
+        ).pack(fill="x", padx=13, pady=(10, 5))
+
+        for item in items:
+            if item is None:
+                customtkinter.CTkFrame(
+                    panel,
+                    height=1,
+                    corner_radius=0,
+                    fg_color=("#D7DADE", "#41454B"),
+                ).pack(fill="x", padx=10, pady=5)
+                continue
+            label, command = item
+            customtkinter.CTkButton(
+                panel,
+                text=label,
+                command=lambda callback=command: self._run(callback),
+                anchor="w",
+                height=36,
+                corner_radius=6,
+                fg_color="transparent",
+                hover_color=("#E1E8F2", "#333A44"),
+                text_color=("#1B1D20", "#F1F3F5"),
+                font=(FONT_TYPE, 14),
+            ).pack(fill="x", padx=7, pady=2)
+
+        self.update_idletasks()
+        width = self.WIDTH
+        height = self.winfo_reqheight()
+        x = min(max(0, x), self.winfo_screenwidth() - width)
+        y = min(max(0, y), self.winfo_screenheight() - height)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        # 子ボタンへのフォーカス移動を待ってから、外側クリックで閉じる。
+        self.after(100, lambda: self.bind("<FocusOut>", self._close_if_focus_left))
+
+    def _run(self, command):
+        self.destroy()
+        command()
+
+    def _close_if_focus_left(self, _event):
+        def check():
+            if not self.winfo_exists():
+                return
+            focused = self.focus_get()
+            if focused is None or focused.winfo_toplevel() is not self:
+                self.destroy()
+
+        self.after(20, check)
+
+
+class ModernNameDialog(customtkinter.CTkToplevel):
+    """ファイル／ディレクトリ名を入力するモーダルダイアログ。"""
+
+    def __init__(self, master, kind):
+        super().__init__(master)
+        self.result = None
+        self.kind = kind
+        label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
+
+        self.title(f"新規{label}")
+        self.geometry("420x210")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        customtkinter.CTkLabel(
+            self,
+            text=f"新規{label}",
+            anchor="w",
+            font=(FONT_TYPE, 20, "bold"),
+        ).grid(row=0, column=0, padx=24, pady=(22, 4), sticky="ew")
+
+        content = customtkinter.CTkFrame(self, fg_color="transparent")
+        content.grid(row=1, column=0, padx=24, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        customtkinter.CTkLabel(
+            content,
+            text=f"{label}名",
+            anchor="w",
+            text_color=("#555B63", "#B7BDC5"),
+        ).grid(row=0, column=0, sticky="ew")
+        placeholder = "例: scene01.json" if kind == TreeNode.FILE else "例: Chapter 1"
+        self.entry = customtkinter.CTkEntry(
+            content,
+            height=40,
+            corner_radius=8,
+            placeholder_text=placeholder,
+            font=(FONT_TYPE, 14),
+        )
+        self.entry.grid(row=1, column=0, pady=(5, 2), sticky="ew")
+        self.error_label = customtkinter.CTkLabel(
+            content,
+            text="",
+            anchor="w",
+            height=20,
+            text_color=("#C62828", "#FF7B72"),
+            font=(FONT_TYPE, 12),
+        )
+        self.error_label.grid(row=2, column=0, sticky="ew")
+
+        actions = customtkinter.CTkFrame(self, fg_color="transparent")
+        actions.grid(row=2, column=0, padx=24, pady=(8, 20), sticky="e")
+        customtkinter.CTkButton(
+            actions,
+            text="キャンセル",
+            width=100,
+            fg_color=("#D9DDE2", "#3A3D42"),
+            hover_color=("#C8CDD3", "#4A4E54"),
+            text_color=("#202124", "#F1F3F5"),
+            command=self.destroy,
+        ).grid(row=0, column=0, padx=(0, 8))
+        customtkinter.CTkButton(
+            actions,
+            text="作成",
+            width=100,
+            command=self.submit,
+        ).grid(row=0, column=1)
+
+        self.bind("<Return>", self.submit)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.after_idle(self._show)
+
+    def _show(self):
+        self.update_idletasks()
+        master = self.master
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.grab_set()
+        self.entry.focus_set()
+
+    def submit(self, _event=None):
+        name = self.entry.get().strip()
+        try:
+            ProjectStore.validate_name(name)
+            if self.kind == TreeNode.FILE and not name.lower().endswith(".json"):
+                ProjectStore.validate_name(name + ".json")
+        except ValueError as error:
+            self.error_label.configure(text=str(error))
+            self.entry.focus_set()
+            return "break"
+        self.result = name
+        self.destroy()
+        return "break"
+
+    @classmethod
+    def ask(cls, master, kind):
+        dialog = cls(master, kind)
+        master.wait_window(dialog)
+        return dialog.result
+
+
 class App(customtkinter.CTk):
     EXPLORER_WIDTH = 240
     CONTROL_WIDTH = 140
@@ -255,6 +438,7 @@ class App(customtkinter.CTk):
         super().__init__()
         self.project = ProjectStore()
         self.current_node = None
+        self.context_popup = None
         self.saved_payload = {"speaker": "", "text": ""}
         self.fonts = (FONT_TYPE, 15)
         self.setup_form()
@@ -306,6 +490,7 @@ class App(customtkinter.CTk):
         self.current_label.grid(row=5, column=0, sticky="ew")
         self.editor.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
+        self.bind("<Control-s>", self.save_shortcut, add="+")
         self.clear_editor()
 
     def payload(self):
@@ -422,6 +607,11 @@ class App(customtkinter.CTk):
         self.update_status()
         return True
 
+    def save_shortcut(self, _event=None):
+        """Ctrl+Sで、現在開いているファイルを保存する。"""
+        self.save_current()
+        return "break"
+
     def send(self):
         if self.current_node:
             print(json.dumps(self.payload(), ensure_ascii=False))
@@ -486,21 +676,25 @@ class App(customtkinter.CTk):
 
     def context_menu(self, node, event):
         parent = node if node and node.is_directory else (node.parent if node else None)
-        menu = tk.Menu(self, tearoff=False)
-        menu.add_command(label="新規ファイル", command=lambda: self.create_node(parent, TreeNode.FILE))
-        menu.add_command(label="新規ディレクトリ", command=lambda: self.create_node(parent, TreeNode.DIRECTORY))
+        if self.context_popup is not None and self.context_popup.winfo_exists():
+            self.context_popup.destroy()
+        location = parent.text if parent else "Projectルート"
+        items = [
+            ("＋  新規ファイル", lambda: self.create_node(parent, TreeNode.FILE)),
+            ("▰  新規ディレクトリ", lambda: self.create_node(parent, TreeNode.DIRECTORY)),
+        ]
         if parent:
-            menu.add_separator()
-            menu.add_command(label="ルートに新規ファイル", command=lambda: self.create_node(None, TreeNode.FILE))
-            menu.add_command(label="ルートに新規ディレクトリ", command=lambda: self.create_node(None, TreeNode.DIRECTORY))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+            items.extend([
+                None,
+                ("＋  ルートに新規ファイル", lambda: self.create_node(None, TreeNode.FILE)),
+                ("▰  ルートに新規ディレクトリ", lambda: self.create_node(None, TreeNode.DIRECTORY)),
+            ])
+        self.context_popup = ModernContextMenu(
+            self, f"作成先: {location}", items, event.x_root, event.y_root
+        )
 
     def create_node(self, parent, kind):
-        label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
-        name = simpledialog.askstring(f"新規{label}", f"{label}名", parent=self)
+        name = ModernNameDialog.ask(self, kind)
         if name is None:
             return
         try:
