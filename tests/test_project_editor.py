@@ -230,6 +230,36 @@ class EditorTests(unittest.TestCase):
         self.assertFalse((self.project.path.parent / 'first.json').exists())
         self.assertEqual(self.project.read_file(self.first)['text'], 'unsaved')
 
+    def test_control_s_saves_current_file(self):
+        app = self.app
+        app.editor.insert('1.0', 'shortcut')
+        app.editor._textbox.focus_set()
+        app.update()
+        app.editor._textbox.event_generate('<Control-KeyPress-s>')
+        app.update()
+        self.assertEqual(self.project.read_file(self.first)['text'], 'shortcut')
+        self.assertFalse(app.is_dirty())
+
+    def test_modern_creation_ui(self):
+        app = self.app
+        event = type('Event', (), {'x_root': 100, 'y_root': 100})()
+        app.context_menu(self.folder, event)
+        app.update()
+        self.assertIsInstance(app.context_popup, main.ModernContextMenu)
+        self.assertTrue(app.context_popup.winfo_exists())
+        app.context_popup.destroy()
+
+        dialog = main.ModernNameDialog(app, TreeNode.FILE)
+        app.update()
+        dialog.entry.insert(0, '../invalid')
+        dialog.submit()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertTrue(dialog.error_label.cget('text'))
+        dialog.entry.delete(0, 'end')
+        dialog.entry.insert(0, 'scene')
+        dialog.submit()
+        self.assertEqual(dialog.result, 'scene')
+
     def test_failed_save_cancels_switch(self):
         app = self.app
         app.editor.insert('1.0', 'keep')
