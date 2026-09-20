@@ -253,7 +253,7 @@ class EditorTests(unittest.TestCase):
         with patch.object(app.connection, 'submit') as submit:
             app.toggle_connection()
             app.toggle_connection()
-            submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example', None)
+            submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example/chat', None)
             self.assertEqual(entry.cget('state'), 'disabled')
             self.assertEqual(app.send_button.cget('state'), 'disabled')
             app.connection.events.put(ConnectionEvent('connected', '接続済み'))
@@ -286,9 +286,21 @@ class EditorTests(unittest.TestCase):
         app.login_password.insert(0, 'test-only-password')
         with patch.object(app.connection, 'submit') as submit:
             app.login_and_connect()
-        submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example',
+        submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example/chat',
                                        ('user@example.invalid', 'test-only-password'))
         self.assertIsNone(app.login_panel)
+
+    def test_chat_url_is_not_appended_twice(self):
+        for suffix in ('/chat', '/chat/'):
+            with self.subTest(suffix=suffix):
+                self.app.set_connection_state('disconnected', '')
+                entry = self.app.url_input.room_url
+                entry.delete(0, 'end')
+                entry.insert(0, 'https://ccfolia.com/rooms/example' + suffix)
+                with patch.object(self.app.connection, 'submit') as submit:
+                    self.app.toggle_connection()
+                submit.assert_called_once_with(
+                    'connect', 'https://ccfolia.com/rooms/example/chat', None)
 
     def test_invalid_url_does_not_connect(self):
         app = self.app
