@@ -6,12 +6,10 @@ from queue import Empty
 import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox
-
 import customtkinter
-import config
 from ccfolia_connection import ConnectionWorker, room_url
 
-FONT_TYPE = config.FONT_TYPE
+FONT_TYPE = "meiryo"
 
 
 def atomic_json(path, data):
@@ -454,7 +452,7 @@ class App(customtkinter.CTk):
 
     def setup_form(self):
         customtkinter.set_appearance_mode("dark")
-        self.geometry("1000x650")
+        self.geometry("1000x500")
         self.minsize(760, 400)
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -661,6 +659,8 @@ class App(customtkinter.CTk):
             return
         try:
             url = room_url(self.url_input.room_url.get())
+            if not url.endswith("/chat"):
+                url += "/chat"
         except ValueError as error:
             self.connection_label.configure(text=str(error))
             return
