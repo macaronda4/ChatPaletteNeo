@@ -480,12 +480,22 @@ class App(customtkinter.CTk):
         self.tree.root_nodes = self.project.roots
 
         # URL入力欄と同じ親・列・余白にして幅を一致させる。
-        self.editor = customtkinter.CTkTextbox(self, font=self.fonts, wrap="word")
+        self.editor = customtkinter.CTkTextbox(
+            self, font=self.fonts, wrap="word", undo=True, autoseparators=True, maxundo=1000
+        )
         self.editor.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="nsew")
         controls = customtkinter.CTkFrame(self, fg_color="transparent", width=self.CONTROL_WIDTH)
         controls.grid(row=1, column=2, padx=10, pady=(0, 10), sticky="nsew")
         controls.grid_columnconfigure(0, weight=1)
-        self.speaker = customtkinter.CTkEntry(controls, placeholder_text="話者", width=self.CONTROL_WIDTH, font=self.fonts)
+        self._speaker_var = tk.StringVar(master=self, value="")
+        self._speaker_history = [""]
+        self._speaker_index = 0
+        self._speaker_replaying = False
+        self.speaker = customtkinter.CTkEntry(
+            controls, placeholder_text="話者", width=self.CONTROL_WIDTH,
+            font=self.fonts, textvariable=self._speaker_var
+        )
+        self._speaker_var.trace_add("write", self.record_speaker_edit)
         self.speaker.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         self.previous_button = customtkinter.CTkButton(controls, text="前へ", command=lambda: self.navigate(-1), width=self.CONTROL_WIDTH)
         self.next_button = customtkinter.CTkButton(controls, text="次へ", command=lambda: self.navigate(1), width=self.CONTROL_WIDTH)
@@ -506,7 +516,52 @@ class App(customtkinter.CTk):
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.bind("<Control-s>", self.save_shortcut, add="+")
         self.bind("<Control-n>", self.new_file_shortcut, add="+")
+        for widget, field in ((self.editor, "text"), (self.speaker, "speaker")):
+            for sequence, redo in (("<Control-z>", False), ("<Control-Shift-Z>", True),
+                                   ("<Control-Shift-z>", True), ("<Control-y>", True)):
+                widget.bind(sequence, lambda event, field=field, redo=redo:
+                            self.undo_redo(field, redo), add="+")
         self.clear_editor()
+
+    def record_speaker_edit(self, *_args):
+        if self._speaker_replaying:
+            return
+        value = self._speaker_var.get()
+        if value == self._speaker_history[self._speaker_index]:
+            return
+        self._speaker_history = self._speaker_history[:self._speaker_index + 1] + [value]
+        self._speaker_history = self._speaker_history[-101:]
+        self._speaker_index = len(self._speaker_history) - 1
+
+    def reset_edit_history(self):
+        self.editor._textbox.edit_reset()
+        self._speaker_history = [self.speaker.get()]
+        self._speaker_index = 0
+
+    def undo_redo(self, field, redo=False):
+        if self.current_node is None or self._closing:
+            return "break"
+        if field == "text":
+            try:
+                if redo:
+                    self.editor._textbox.edit_redo()
+                else:
+                    self.editor._textbox.edit_undo()
+            except tk.TclError:
+                # Tk raises when there is no undo/redo history.
+                pass
+        else:
+            index = self._speaker_index + (1 if redo else -1)
+            if 0 <= index < len(self._speaker_history):
+                self._speaker_replaying = True
+                try:
+                    self._speaker_var.set(self._speaker_history[index])
+                    self._speaker_index = index
+                    self.speaker.icursor("end")
+                finally:
+                    self._speaker_replaying = False
+        self.update_status()
+        return "break"
 
     def payload(self):
         return {"speaker": self.speaker.get(), "text": self.editor.get("1.0", "end-1c")}
@@ -534,6 +589,7 @@ class App(customtkinter.CTk):
         self.speaker.configure(state="normal")
         self.editor.delete("1.0", "end")
         self.speaker.delete(0, "end")
+        self.reset_edit_history()
         self.editor.configure(state="disabled")
         self.speaker.configure(state="disabled")
         self.save_button.configure(state="disabled")
@@ -583,6 +639,7 @@ class App(customtkinter.CTk):
         self.editor.insert("1.0", payload["text"])
         self.speaker.delete(0, "end")
         self.speaker.insert(0, payload["speaker"])
+        self.reset_edit_history()
         self.save_button.configure(state="normal")
         self.send_button.configure(state="normal")
         self.tree.selected_node = node
@@ -620,6 +677,7 @@ class App(customtkinter.CTk):
             self.report_error(error)
             return False
         self.saved_payload = dict(payload)
+        self.editor._textbox.edit_separator()
         self.update_status()
         return True
 
