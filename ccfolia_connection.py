@@ -14,9 +14,9 @@ def room_url(value):
     value = value.strip()
     parsed = urlsplit(value)
     if (parsed.scheme != "https" or parsed.netloc != "ccfolia.com"
-            or not re.fullmatch(r"/rooms/[A-Za-z0-9_-]+/?", parsed.path)
+            or not re.fullmatch(r"/rooms/[A-Za-z0-9_-]+(/chat)?/?", parsed.path)
             or parsed.query or parsed.fragment):
-        raise ValueError("https://ccfolia.com/rooms/ルームID の形式で入力してください。")
+        raise ValueError("https://ccfolia.com/rooms/ルームID/ の形式で入力してください。")
     return value.rstrip("/")
 
 
@@ -49,8 +49,8 @@ class HeadlessRoom:
             ) from None
         try:
             self.runtime = sync_playwright().start()
-            self.browser = self.runtime.chromium.launch(headless=True, timeout=20000)
-            self.context = self.browser.new_context(locale="ja-JP", viewport={"width": 1280, "height": 900})
+            self.browser = self.runtime.chromium.launch(headless=False, timeout=20000)
+            self.context = self.browser.new_context(locale="ja-JP", viewport={"width": 1280, "height": 720})
             self.page = self.context.new_page()
             self.page.set_default_timeout(8000)
             self.page.set_default_navigation_timeout(25000)
@@ -88,6 +88,7 @@ class HeadlessRoom:
         return self.page.get_by_role("tab", name="メイン", exact=True)
 
     def connect(self, url, credentials=None):
+        print(url)
         self.url = room_url(url)
         self._launch()
         try:
@@ -118,7 +119,8 @@ class HeadlessRoom:
                 raise ConnectionProblem("送信先のメインタブを確認できません。")
         except (AccessUnavailable, ConnectionProblem):
             raise
-        except Exception:
+        except Exception as e:
+            print(e)
             raise ConnectionProblem("接続に失敗しました。通信状態やココフォリアの画面変更を確認してください。") from None
 
     def alive(self):
