@@ -49,7 +49,7 @@ class HeadlessRoom:
             ) from None
         try:
             self.runtime = sync_playwright().start()
-            self.browser = self.runtime.chromium.launch(headless=False, timeout=20000)
+            self.browser = self.runtime.chromium.launch(headless=True, timeout=20000)
             self.context = self.browser.new_context(locale="ja-JP", viewport={"width": 1280, "height": 720})
             self.page = self.context.new_page()
             self.page.set_default_timeout(8000)
@@ -85,7 +85,39 @@ class HeadlessRoom:
                 or self.page.get_by_text("見学者はメッセージを送信できません", exact=True).is_visible())
 
     def _main_tab(self):
-        return self.page.get_by_role("tab", name="メイン", exact=True)
+        tabs = self.page.get_by_role("tab")
+        # Accessible names can include notification badges or an aria-label.
+        # Match the visible label as well, without matching e.g. "メイン相談".
+        return (
+            self.page.get_by_role("tab", name="メイン", exact=True)
+            .or_(tabs.filter(has_text=re.compile(r"^\s*メイン\s*$")))
+            .or_(tabs.filter(has=self.page.get_by_text("メイン", exact=True)))
+            .and_(self.page.locator(":visible"))
+        )
+
+    def _select_main_tab(self):
+        from playwright.sync_api import expect
+        tab = self._main_tab()
+        try:
+            # Do not silently choose the first match if the target is ambiguous.
+            expect(tab).to_have_count(1, timeout=8000)
+        except Exception:
+            tabs = self.page.get_by_role("tab").and_(self.page.locator(":visible"))
+            labels = self.page.get_by_text("メイン", exact=True).and_(self.page.locator(":visible"))
+            raise ConnectionProblem(
+                "送信先の「メイン」を特定できません。"
+                f"（表示中のtab要素: {tabs.count()}、"
+                f"「メイン」の表示: {labels.count()}、候補: {tab.count()}）"
+                "タブ名やHTMLのroleを確認してください。送信は行っていません。"
+            ) from None
+        try:
+            tab.click()
+            # React updates aria-selected asynchronously after the click.
+            expect(tab).to_have_attribute("aria-selected", "true", timeout=8000)
+        except Exception:
+            raise ConnectionProblem(
+                "「メイン」の選択完了を確認できません。送信は行っていません。"
+            ) from None
 
     def connect(self, url, credentials=None):
         print(url)
@@ -114,9 +146,7 @@ class HeadlessRoom:
             if room_url(self.page.url) != self.url:
                 raise ConnectionProblem("指定したルームと接続先が一致しません。")
             # Never inherit a secret/group channel implicitly.
-            self._main_tab().click()
-            if self._main_tab().get_attribute("aria-selected") != "true":
-                raise ConnectionProblem("送信先のメインタブを確認できません。")
+            self._select_main_tab()
         except (AccessUnavailable, ConnectionProblem):
             raise
         except Exception as e:
@@ -140,9 +170,7 @@ class HeadlessRoom:
         if not text.strip() or not speaker.strip():
             raise ConnectionProblem("話者と本文を入力してください。")
         try:
-            self._main_tab().click()
-            if self._main_tab().get_attribute("aria-selected") != "true":
-                raise ConnectionProblem("送信先を確認できません。")
+            self._select_main_tab()
             name = self.page.get_by_label("名前", exact=True)
             name.fill(speaker)
             name.press("Tab")
