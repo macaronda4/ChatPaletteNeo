@@ -284,11 +284,12 @@ class ModernContextMenu(customtkinter.CTkToplevel):
                     fg_color=("#D7DADE", "#41454B"),
                 ).pack(fill="x", padx=10, pady=5)
                 continue
-            label, command = item
+            label, command, *enabled = item
             customtkinter.CTkButton(
                 panel,
                 text=label,
                 command=lambda callback=command: self._run(callback),
+                state="normal" if not enabled or enabled[0] else "disabled",
                 anchor="w",
                 height=36,
                 corner_radius=6,
@@ -504,6 +505,7 @@ class App(customtkinter.CTk):
         self.editor.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.bind("<Control-s>", self.save_shortcut, add="+")
+        self.bind("<Control-n>", self.new_file_shortcut, add="+")
         self.clear_editor()
 
     def payload(self):
@@ -563,7 +565,7 @@ class App(customtkinter.CTk):
     def report_error(self, error):
         messagebox.showerror("操作できませんでした", str(error), parent=self)
 
-    def file_clicked(self, node):
+    def file_clicked(self, node, confirm=True):
         if node is self.current_node:
             return
         try:
@@ -571,7 +573,7 @@ class App(customtkinter.CTk):
         except (OSError, ValueError, TypeError) as error:
             self.report_error(error)
             return
-        if not self.confirm_edits():
+        if confirm and not self.confirm_edits():
             return
         self.current_node = node
         self.saved_payload = dict(payload)
@@ -635,6 +637,21 @@ class App(customtkinter.CTk):
             return
         self.set_connection_state("sending", "送信中…")
         self.connection.submit("send", payload)
+
+    def send_file(self, node):
+        """Open the context-menu target, then use the usual send guards."""
+        if self._closing or not node.is_file or self.connection_state != "connected":
+            return
+        self.file_clicked(node)
+        # Switching can be cancelled, or fail to read/save a file.
+        if self.current_node is node:
+            self.send()
+
+    def new_file_shortcut(self, _event=None):
+        if not self._closing:
+            parent = self.current_node.parent if self.current_node else None
+            self.create_node(parent, TreeNode.FILE)
+        return "break"
 
     def set_connection_state(self, state, message):
         self.connection_state = state
@@ -807,6 +824,11 @@ class App(customtkinter.CTk):
             ("＋  新規ファイル", lambda: self.create_node(parent, TreeNode.FILE)),
             ("▰  新規ディレクトリ", lambda: self.create_node(parent, TreeNode.DIRECTORY)),
         ]
+        if node and node.is_file:
+            items[0:0] = [
+                ("送信", lambda: self.send_file(node), self.connection_state == "connected"),
+                None,
+            ]
         if parent:
             items.extend([
                 None,
@@ -821,6 +843,8 @@ class App(customtkinter.CTk):
         name = ModernNameDialog.ask(self, kind)
         if name is None:
             return
+        if kind == TreeNode.FILE and not self.confirm_edits():
+            return
         try:
             node = self.project.create(parent, name, kind)
         except (OSError, ValueError) as error:
@@ -829,7 +853,7 @@ class App(customtkinter.CTk):
         self.tree.refresh()
         self.update_status()
         if node.is_file:
-            self.file_clicked(node)
+            self.file_clicked(node, confirm=False)
 
 
 class ChoosePjFile(customtkinter.CTkFrame):
