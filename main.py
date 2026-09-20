@@ -659,8 +659,8 @@ class App(customtkinter.CTk):
             return
         try:
             url = self.url_input.room_url.get().rstrip("/")
-            if not url.endswith("/chat/"):
-                url += "/chat/"
+            if not url.endswith("/chat"):
+                url += "/chat"
             url = room_url(url)
         except ValueError as error:
             self.connection_label.configure(text=str(error))
