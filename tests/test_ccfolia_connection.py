@@ -59,7 +59,7 @@ class AdapterTests(unittest.TestCase):
     def test_send_multiline_without_enter_and_no_auto_retry(self):
         page = self.client.page
         page.get_by_role.return_value.get_attribute.return_value = 'true'
-        page.get_by_label.return_value.input_value.return_value = 'actor'
+        page.locator.return_value.input_value.return_value = 'actor'
         page.get_by_placeholder.return_value.input_value.return_value = 'line 1\nline 2'
         with patch.object(self.client, 'alive', return_value=True):
             result = self.client.send({'speaker': 'actor', 'text': 'line 1\nline 2'})
@@ -79,7 +79,6 @@ class AdapterTests(unittest.TestCase):
                 tab = MagicMock()
                 tab.count.return_value = candidates
                 self.client.page.get_by_role.return_value.and_.return_value.count.return_value = 3
-                self.client.page.get_by_text.return_value.and_.return_value.count.return_value = 1
                 self.api.expect.return_value.to_have_count.side_effect = TimeoutError()
                 with patch.object(self.client, '_main_tab', return_value=tab):
                     with self.assertRaises(ConnectionProblem) as caught:
@@ -99,15 +98,54 @@ class AdapterTests(unittest.TestCase):
 
     def test_unconfirmed_selection_stops_before_filling_or_sending(self):
         self.api.expect.return_value.to_have_attribute.side_effect = TimeoutError()
+        self.client.page.get_by_role.return_value.locator.return_value.count.return_value = 1
         with patch.object(self.client, 'alive', return_value=True):
             with self.assertRaises(ConnectionProblem) as caught:
                 self.client.send({'speaker': 'actor', 'text': 'hello'})
         self.assertIn('選択完了', str(caught.exception))
         self.client.page.get_by_placeholder.return_value.fill.assert_not_called()
-        self.client.page.get_by_role.assert_any_call('tab', name='メイン', exact=True)
+        self.client.page.get_by_role.return_value.locator.assert_called_with('button#main[role="tab"]')
         self.assertNotIn(
             unittest.mock.call('button', name='送信', exact=True),
             self.client.page.get_by_role.call_args_list)
+
+    def test_announcement_is_closed_before_selecting_main(self):
+        dialog = self.client.page.get_by_role.return_value.filter.return_value
+        dialog.count.return_value = 1
+        dialog.is_visible.return_value = True
+        tab = MagicMock()
+        actions = []
+        dialog.get_by_role.return_value.click.side_effect = lambda: actions.append('close')
+        tab.click.side_effect = lambda: actions.append('select')
+        with patch.object(self.client, '_main_tab', return_value=tab):
+            self.client._select_main_tab()
+        self.assertEqual(actions, ['close', 'select'])
+        dialog.get_by_role.assert_called_once_with('button', name='閉じる', exact=True)
+        dialog.wait_for.assert_called_once_with(state='hidden', timeout=8000)
+
+    def test_late_announcement_retries_only_tab_selection(self):
+        tab = MagicMock()
+        tab.click.side_effect = [TimeoutError(), None]
+        with patch.object(self.client, '_main_tab', return_value=tab), \
+                patch.object(self.client, '_dismiss_announcement', side_effect=[False, True]):
+            self.client._select_main_tab()
+        self.assertEqual(tab.click.call_count, 2)
+
+    def test_unknown_overlay_does_not_trigger_retry(self):
+        tab = MagicMock()
+        tab.count.return_value = 1
+        tab.click.side_effect = TimeoutError()
+        with patch.object(self.client, '_main_tab', return_value=tab), \
+                patch.object(self.client, '_dismiss_announcement', return_value=False):
+            with self.assertRaises(ConnectionProblem):
+                self.client._select_main_tab()
+        tab.click.assert_called_once()
+
+    def test_missing_announcement_does_not_close_other_dialogs(self):
+        dialog = self.client.page.get_by_role.return_value.filter.return_value
+        dialog.count.return_value = 0
+        self.assertFalse(self.client._dismiss_announcement())
+        dialog.get_by_role.assert_not_called()
 
 
 class WorkerTests(unittest.TestCase):
