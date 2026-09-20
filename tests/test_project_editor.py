@@ -339,6 +339,69 @@ class EditorTests(unittest.TestCase):
         self.assertIs(app.current_node, self.first)
         self.assertTrue(app.is_dirty())
 
+    def context_send_button(self, node):
+        self.app.context_menu(node, type('Event', (), {'x_root': 100, 'y_root': 100})())
+        self.app.update()
+        def buttons(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, main.customtkinter.CTkButton):
+                    yield child
+                yield from buttons(child)
+        return next(button for button in buttons(self.app.context_popup)
+                    if button.cget('text') == '送信')
+
+    def test_context_send_uses_clicked_file(self):
+        payload = {'speaker': 'target', 'text': 'second file'}
+        self.project.save_file(self.second, payload)
+        self.app.set_connection_state('connected', '')
+        button = self.context_send_button(self.second)
+        with patch.object(self.app.connection, 'submit') as submit:
+            button.invoke()
+            self.app.send_file(self.second)
+        submit.assert_called_once_with('send', payload)
+        self.assertIs(self.app.current_node, self.second)
+
+    def test_context_send_cancel_preserves_unsaved_editor(self):
+        self.app.editor.insert('1.0', 'keep draft')
+        self.app.set_connection_state('connected', '')
+        button = self.context_send_button(self.second)
+        with patch('main.messagebox.askyesnocancel', return_value=None), \
+                patch.object(self.app.connection, 'submit') as submit:
+            button.invoke()
+        submit.assert_not_called()
+        self.assertIs(self.app.current_node, self.first)
+        self.assertEqual(self.app.payload()['text'], 'keep draft')
+
+    def test_context_send_disabled_while_disconnected(self):
+        button = self.context_send_button(self.second)
+        self.assertEqual(button.cget('state'), 'disabled')
+        with patch.object(self.app.connection, 'submit') as submit:
+            button.invoke()
+            self.app.send_file(self.second)
+        submit.assert_not_called()
+        self.assertIs(self.app.current_node, self.first)
+        self.app.context_popup.destroy()
+
+    def test_control_n_creates_sibling_and_opens_it(self):
+        self.app.file_clicked(self.second)
+        self.app.editor._textbox.focus_force()
+        self.app.update()
+        with patch.object(main.ModernNameDialog, 'ask', return_value='new sibling'):
+            self.app.editor._textbox.event_generate('<Control-KeyPress-n>')
+            self.app.update()
+        self.assertEqual(self.app.current_node.text, 'new sibling.json')
+        self.assertIs(self.app.current_node.parent, self.folder)
+        self.assertTrue((self.project.path.parent / 'folder/new sibling.json').exists())
+
+    def test_control_n_cancel_does_not_create_file(self):
+        self.app.editor.insert('1.0', 'keep draft')
+        with patch.object(main.ModernNameDialog, 'ask', return_value='cancelled'), \
+                patch('main.messagebox.askyesnocancel', return_value=None):
+            self.assertEqual(self.app.new_file_shortcut(), 'break')
+        self.assertFalse((self.project.path.parent / 'cancelled.json').exists())
+        self.assertIs(self.app.current_node, self.first)
+        self.assertEqual(self.app.payload()['text'], 'keep draft')
+
     def test_new_project_save_cancel_keeps_draft(self):
         app = self.app
         project = ProjectStore()
