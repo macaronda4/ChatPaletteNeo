@@ -245,6 +245,62 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(self.project.read_file(self.first)['text'], 'shortcut')
         self.assertFalse(app.is_dirty())
 
+    def history_key(self, field, sequence):
+        widget = self.app.editor._textbox if field == 'text' else self.app.speaker._entry
+        widget.focus_force()
+        self.app.update()
+        widget.event_generate(sequence)
+        self.app.update()
+
+    def test_undo_redo_shortcuts_for_both_fields(self):
+        for field in ('text', 'speaker'):
+            with self.subTest(field=field):
+                widget = self.app.editor if field == 'text' else self.app.speaker
+                widget.insert('1.0' if field == 'text' else 0, '編集内容')
+                self.history_key(field, '<Control-KeyPress-z>')
+                self.assertEqual(self.app.payload()[field], '')
+                self.history_key(field, '<Control-Shift-KeyPress-Z>')
+                self.assertEqual(self.app.payload()[field], '編集内容')
+                self.history_key(field, '<Control-KeyPress-z>')
+                self.history_key(field, '<Control-KeyPress-y>')
+                self.assertEqual(self.app.payload()[field], '編集内容')
+                self.history_key(field, '<Control-KeyPress-z>')
+                self.assertFalse(self.app.is_dirty())
+
+    def test_new_edit_discards_redo_for_both_fields(self):
+        for field in ('text', 'speaker'):
+            with self.subTest(field=field):
+                widget = self.app.editor if field == 'text' else self.app.speaker
+                index = '1.0' if field == 'text' else 0
+                widget.insert(index, 'old')
+                self.history_key(field, '<Control-KeyPress-z>')
+                widget.insert(index, 'new')
+                self.history_key(field, '<Control-KeyPress-y>')
+                self.assertEqual(self.app.payload()[field], 'new')
+
+    def test_file_switch_clears_both_edit_histories(self):
+        self.app.editor.insert('1.0', 'old text')
+        self.app.speaker.insert(0, 'old speaker')
+        payload = {'speaker': 'next speaker', 'text': 'next text'}
+        self.project.save_file(self.second, payload)
+        with patch('main.messagebox.askyesnocancel', return_value=False):
+            self.app.file_clicked(self.second)
+        for field in ('text', 'speaker'):
+            self.history_key(field, '<Control-KeyPress-z>')
+            self.history_key(field, '<Control-KeyPress-y>')
+        self.assertEqual(self.app.payload(), payload)
+        self.assertFalse(self.app.is_dirty())
+
+    def test_undo_after_save_updates_dirty_state(self):
+        self.app.editor.insert('1.0', 'saved text')
+        self.app.speaker.insert(0, 'saved speaker')
+        self.assertTrue(self.app.save_current())
+        for field in ('text', 'speaker'):
+            self.history_key(field, '<Control-KeyPress-z>')
+            self.assertTrue(self.app.is_dirty())
+            self.history_key(field, '<Control-KeyPress-y>')
+            self.assertFalse(self.app.is_dirty())
+
     def test_connect_locks_url_until_disconnect_completes(self):
         app = self.app
         entry = app.url_input.room_url
