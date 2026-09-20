@@ -658,10 +658,9 @@ class App(customtkinter.CTk):
         if self.connection_state != "disconnected" or self._closing:
             return
         try:
-            url = self.url_input.room_url.get().rstrip("/")
+            url = room_url(self.url_input.room_url.get())
             if not url.endswith("/chat"):
                 url += "/chat"
-            url = room_url(url)
         except ValueError as error:
             self.connection_label.configure(text=str(error))
             return

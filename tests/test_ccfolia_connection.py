@@ -70,8 +70,44 @@ class AdapterTests(unittest.TestCase):
         self.api.expect.return_value.to_have_value.side_effect = TimeoutError()
         with patch.object(self.client, 'alive', return_value=True), self.assertRaises(SendUncertain):
             self.client.send({'speaker': 'actor', 'text': 'line 1\nline 2'})
-        # Exactly one tab click and one submit click; no second submit.
-        self.assertEqual(page.get_by_role.return_value.click.call_count, 2)
+        # Exactly one submit click; no second submit.
+        self.assertEqual(page.get_by_role.return_value.click.call_count, 1)
+
+    def test_missing_or_ambiguous_tab_reports_counts_without_clicking(self):
+        for candidates in (0, 2):
+            with self.subTest(candidates=candidates):
+                tab = MagicMock()
+                tab.count.return_value = candidates
+                self.client.page.get_by_role.return_value.and_.return_value.count.return_value = 3
+                self.client.page.get_by_text.return_value.and_.return_value.count.return_value = 1
+                self.api.expect.return_value.to_have_count.side_effect = TimeoutError()
+                with patch.object(self.client, '_main_tab', return_value=tab):
+                    with self.assertRaises(ConnectionProblem) as caught:
+                        self.client._select_main_tab()
+                self.assertIn(f'候補: {candidates}', str(caught.exception))
+                self.assertIn('表示中のtab要素: 3', str(caught.exception))
+                tab.click.assert_not_called()
+
+    def test_selection_waits_for_attribute_update(self):
+        tab = MagicMock()
+        with patch.object(self.client, '_main_tab', return_value=tab):
+            self.client._select_main_tab()
+        tab.click.assert_called_once()
+        self.api.expect.return_value.to_have_attribute.assert_called_once_with(
+            'aria-selected', 'true', timeout=8000)
+        tab.get_attribute.assert_not_called()
+
+    def test_unconfirmed_selection_stops_before_filling_or_sending(self):
+        self.api.expect.return_value.to_have_attribute.side_effect = TimeoutError()
+        with patch.object(self.client, 'alive', return_value=True):
+            with self.assertRaises(ConnectionProblem) as caught:
+                self.client.send({'speaker': 'actor', 'text': 'hello'})
+        self.assertIn('選択完了', str(caught.exception))
+        self.client.page.get_by_placeholder.return_value.fill.assert_not_called()
+        self.client.page.get_by_role.assert_any_call('tab', name='メイン', exact=True)
+        self.assertNotIn(
+            unittest.mock.call('button', name='送信', exact=True),
+            self.client.page.get_by_role.call_args_list)
 
 
 class WorkerTests(unittest.TestCase):
