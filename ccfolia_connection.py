@@ -85,38 +85,54 @@ class HeadlessRoom:
                 or self.page.get_by_text("見学者はメッセージを送信できません", exact=True).is_visible())
 
     def _main_tab(self):
-        tabs = self.page.get_by_role("tab")
-        # Accessible names can include notification badges or an aria-label.
-        # Match the visible label as well, without matching e.g. "メイン相談".
-        return (
-            self.page.get_by_role("tab", name="メイン", exact=True)
-            .or_(tabs.filter(has_text=re.compile(r"^\s*メイン\s*$")))
-            .or_(tabs.filter(has=self.page.get_by_text("メイン", exact=True)))
-            .and_(self.page.locator(":visible"))
-        )
+        # Verified in both the room and /chat UI: the default main tab has
+        # id="main", while its accessible name can be "メイン 0" (badge text).
+        return self.page.get_by_role("tablist").locator('button#main[role="tab"]')
+
+    def _dismiss_announcement(self):
+        # Close only the observed promotional dialog, never login/permission
+        # dialogs or an arbitrary "閉じる" button. Do not change its checkbox.
+        dialog = self.page.get_by_role("dialog").filter(has_text="7日間再表示しない")
+        if dialog.count() == 1 and dialog.is_visible():
+            dialog.get_by_role("button", name="閉じる", exact=True).click()
+            dialog.wait_for(state="hidden", timeout=8000)
+            return True
+        return False
+
+    def _speaker_box(self):
+        # The actual field has name="name" and placeholder="noname", no
+        # associated label "名前". Scope by its form field name, not nickname.
+        return self.page.locator('input[name="name"]')
 
     def _select_main_tab(self):
         from playwright.sync_api import expect
         tab = self._main_tab()
         try:
-            # Do not silently choose the first match if the target is ambiguous.
-            expect(tab).to_have_count(1, timeout=8000)
+            self._dismiss_announcement()
+            for attempt in range(2):
+                try:
+                    # Do not silently choose the first match if ambiguous.
+                    expect(tab).to_have_count(1, timeout=8000)
+                    tab.click()
+                    expect(tab).to_have_attribute("aria-selected", "true", timeout=8000)
+                    return
+                except Exception:
+                    # The announcement may arrive after the chat renders.
+                    # Only retry tab selection, never a message submission.
+                    if attempt == 0 and self._dismiss_announcement():
+                        continue
+                    raise
         except Exception:
+            if tab.count() == 1:
+                raise ConnectionProblem(
+                    "「メイン」の選択完了を確認できません。送信は行っていません。"
+                ) from None
             tabs = self.page.get_by_role("tab").and_(self.page.locator(":visible"))
-            labels = self.page.get_by_text("メイン", exact=True).and_(self.page.locator(":visible"))
             raise ConnectionProblem(
                 "送信先の「メイン」を特定できません。"
                 f"（表示中のtab要素: {tabs.count()}、"
-                f"「メイン」の表示: {labels.count()}、候補: {tab.count()}）"
-                "タブ名やHTMLのroleを確認してください。送信は行っていません。"
-            ) from None
-        try:
-            tab.click()
-            # React updates aria-selected asynchronously after the click.
-            expect(tab).to_have_attribute("aria-selected", "true", timeout=8000)
-        except Exception:
-            raise ConnectionProblem(
-                "「メイン」の選択完了を確認できません。送信は行っていません。"
+                f"id=mainの候補: {tab.count()}）"
+                "案内ダイアログや画面構造を確認してください。送信は行っていません。"
             ) from None
 
     def connect(self, url, credentials=None):
@@ -171,7 +187,7 @@ class HeadlessRoom:
             raise ConnectionProblem("話者と本文を入力してください。")
         try:
             self._select_main_tab()
-            name = self.page.get_by_label("名前", exact=True)
+            name = self._speaker_box()
             name.fill(speaker)
             name.press("Tab")
             if name.input_value() != speaker:
