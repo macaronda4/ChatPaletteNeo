@@ -2,12 +2,14 @@ import json
 import math
 import os
 from pathlib import Path
+from queue import Empty
 import tempfile
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 
 import customtkinter
 import config
+from ccfolia_connection import ConnectionWorker, room_url
 
 FONT_TYPE = config.FONT_TYPE
 
@@ -247,18 +249,208 @@ class ProjectStore:
         return True
 
 
+class ModernContextMenu(customtkinter.CTkToplevel):
+    """CustomTkinterの外観に合わせた、軽量な右クリックメニュー。"""
+
+    WIDTH = 230
+
+    def __init__(self, master, title, items, x, y):
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.transient(master)
+        self.configure(fg_color=("#F5F6F8", "#202225"))
+
+        panel = customtkinter.CTkFrame(
+            self,
+            corner_radius=10,
+            border_width=1,
+            border_color=("#D7DADE", "#41454B"),
+            fg_color=("#F5F6F8", "#202225"),
+        )
+        panel.pack(fill="both", expand=True)
+        customtkinter.CTkLabel(
+            panel,
+            text=title,
+            anchor="w",
+            font=(FONT_TYPE, 12),
+            text_color=("#60656D", "#AEB4BC"),
+        ).pack(fill="x", padx=13, pady=(10, 5))
+
+        for item in items:
+            if item is None:
+                customtkinter.CTkFrame(
+                    panel,
+                    height=1,
+                    corner_radius=0,
+                    fg_color=("#D7DADE", "#41454B"),
+                ).pack(fill="x", padx=10, pady=5)
+                continue
+            label, command = item
+            customtkinter.CTkButton(
+                panel,
+                text=label,
+                command=lambda callback=command: self._run(callback),
+                anchor="w",
+                height=36,
+                corner_radius=6,
+                fg_color="transparent",
+                hover_color=("#E1E8F2", "#333A44"),
+                text_color=("#1B1D20", "#F1F3F5"),
+                font=(FONT_TYPE, 14),
+            ).pack(fill="x", padx=7, pady=2)
+
+        self.update_idletasks()
+        width = self.WIDTH
+        height = self.winfo_reqheight()
+        x = min(max(0, x), self.winfo_screenwidth() - width)
+        y = min(max(0, y), self.winfo_screenheight() - height)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        # 子ボタンへのフォーカス移動を待ってから、外側クリックで閉じる。
+        self.after(100, lambda: self.bind("<FocusOut>", self._close_if_focus_left))
+
+    def _run(self, command):
+        self.destroy()
+        command()
+
+    def _close_if_focus_left(self, _event):
+        def check():
+            if not self.winfo_exists():
+                return
+            focused = self.focus_get()
+            if focused is None or focused.winfo_toplevel() is not self:
+                self.destroy()
+
+        self.after(20, check)
+
+
+class ModernNameDialog(customtkinter.CTkToplevel):
+    """ファイル／ディレクトリ名を入力するモーダルダイアログ。"""
+
+    def __init__(self, master, kind):
+        super().__init__(master)
+        self.result = None
+        self.kind = kind
+        label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
+
+        self.title(f"新規{label}")
+        self.geometry("420x210")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        customtkinter.CTkLabel(
+            self,
+            text=f"新規{label}",
+            anchor="w",
+            font=(FONT_TYPE, 20, "bold"),
+        ).grid(row=0, column=0, padx=24, pady=(22, 4), sticky="ew")
+
+        content = customtkinter.CTkFrame(self, fg_color="transparent")
+        content.grid(row=1, column=0, padx=24, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        customtkinter.CTkLabel(
+            content,
+            text=f"{label}名",
+            anchor="w",
+            text_color=("#555B63", "#B7BDC5"),
+        ).grid(row=0, column=0, sticky="ew")
+        placeholder = "例: scene01.json" if kind == TreeNode.FILE else "例: Chapter 1"
+        self.entry = customtkinter.CTkEntry(
+            content,
+            height=40,
+            corner_radius=8,
+            placeholder_text=placeholder,
+            font=(FONT_TYPE, 14),
+        )
+        self.entry.grid(row=1, column=0, pady=(5, 2), sticky="ew")
+        self.error_label = customtkinter.CTkLabel(
+            content,
+            text="",
+            anchor="w",
+            height=20,
+            text_color=("#C62828", "#FF7B72"),
+            font=(FONT_TYPE, 12),
+        )
+        self.error_label.grid(row=2, column=0, sticky="ew")
+
+        actions = customtkinter.CTkFrame(self, fg_color="transparent")
+        actions.grid(row=2, column=0, padx=24, pady=(8, 20), sticky="e")
+        customtkinter.CTkButton(
+            actions,
+            text="キャンセル",
+            width=100,
+            fg_color=("#D9DDE2", "#3A3D42"),
+            hover_color=("#C8CDD3", "#4A4E54"),
+            text_color=("#202124", "#F1F3F5"),
+            command=self.destroy,
+        ).grid(row=0, column=0, padx=(0, 8))
+        customtkinter.CTkButton(
+            actions,
+            text="作成",
+            width=100,
+            command=self.submit,
+        ).grid(row=0, column=1)
+
+        self.bind("<Return>", self.submit)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.after_idle(self._show)
+
+    def _show(self):
+        self.update_idletasks()
+        master = self.master
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.grab_set()
+        self.entry.focus_set()
+
+    def submit(self, _event=None):
+        name = self.entry.get().strip()
+        try:
+            ProjectStore.validate_name(name)
+            if self.kind == TreeNode.FILE and not name.lower().endswith(".json"):
+                ProjectStore.validate_name(name + ".json")
+        except ValueError as error:
+            self.error_label.configure(text=str(error))
+            self.entry.focus_set()
+            return "break"
+        self.result = name
+        self.destroy()
+        return "break"
+
+    @classmethod
+    def ask(cls, master, kind):
+        dialog = cls(master, kind)
+        master.wait_window(dialog)
+        return dialog.result
+
+
 class App(customtkinter.CTk):
     EXPLORER_WIDTH = 240
     CONTROL_WIDTH = 140
 
-    def __init__(self):
+    def __init__(self, connection_worker=None):
         super().__init__()
+        self.connection = connection_worker if connection_worker is not None else ConnectionWorker()
+        self.connection_state = "disconnected"
+        self._connection_poll = None
+        self._closing = False
+        self.login_panel = None
         self.project = ProjectStore()
         self.current_node = None
+        self.context_popup = None
         self.saved_payload = {"speaker": "", "text": ""}
         self.fonts = (FONT_TYPE, 15)
         self.setup_form()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self._connection_poll = self.after(100, self.poll_connection)
 
     def setup_form(self):
         customtkinter.set_appearance_mode("dark")
@@ -270,7 +462,7 @@ class App(customtkinter.CTk):
 
         self.choosePjFile = ChoosePjFile(self, self.open_project, self.new_project)
         self.choosePjFile.grid(row=0, column=0, padx=(10, 0), pady=10, sticky="ew")
-        self.url_input = UrlInput(self, self.fonts, self.CONTROL_WIDTH)
+        self.url_input = UrlInput(self, self.fonts, self.CONTROL_WIDTH, self.toggle_connection)
         self.url_input.room_url.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
         self.url_input.room_connect.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
 
@@ -304,8 +496,16 @@ class App(customtkinter.CTk):
             button.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         self.current_label = customtkinter.CTkLabel(controls, text="ファイル未選択", wraplength=140, justify="left")
         self.current_label.grid(row=5, column=0, sticky="ew")
+        self.connection_label = customtkinter.CTkLabel(controls, text="未接続", wraplength=140, justify="left")
+        self.connection_label.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        self.login_button = customtkinter.CTkButton(
+            controls, text="ログイン（任意）", width=self.CONTROL_WIDTH, command=self.show_login
+        )
+        self.login_button.grid(row=7, column=0, sticky="ew", pady=8)
+        self.login_button.grid_remove()
         self.editor.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
+        self.bind("<Control-s>", self.save_shortcut, add="+")
         self.clear_editor()
 
     def payload(self):
@@ -325,6 +525,7 @@ class App(customtkinter.CTk):
         index = files.index(self.current_node) if self.current_node in files else -1
         self.previous_button.configure(state="normal" if index > 0 else "disabled")
         self.next_button.configure(state="normal" if 0 <= index < len(files) - 1 else "disabled")
+        self.send_button.configure(state="normal" if self.current_node and self.connection_state == "connected" else "disabled")
 
     def clear_editor(self):
         self.current_node = None
@@ -422,9 +623,111 @@ class App(customtkinter.CTk):
         self.update_status()
         return True
 
+    def save_shortcut(self, _event=None):
+        """Ctrl+Sで、現在開いているファイルを保存する。"""
+        self.save_current()
+        return "break"
+
     def send(self):
-        if self.current_node:
-            print(json.dumps(self.payload(), ensure_ascii=False))
+        if self.current_node is None or self.connection_state != "connected":
+            return
+        payload = self.payload()
+        if not payload["text"].strip() or not payload["speaker"].strip():
+            self.connection_label.configure(text="話者と本文を入力してください。")
+            return
+        self.set_connection_state("sending", "送信中…")
+        self.connection.submit("send", payload)
+
+    def set_connection_state(self, state, message):
+        self.connection_state = state
+        self.connection_label.configure(text=message)
+        self.url_input.room_url.configure(state="normal" if state == "disconnected" else "disabled")
+        labels = {"disconnected": "接続", "connecting": "接続中…", "connected": "切断",
+                  "sending": "切断", "disconnecting": "切断中…"}
+        self.url_input.room_connect.configure(
+            text=labels[state], state="normal" if state in ("disconnected", "connected") else "disabled"
+        )
+        self.update_status()
+
+    def toggle_connection(self):
+        if self.connection_state == "connected":
+            self.set_connection_state("disconnecting", "切断中…")
+            self.connection.submit("disconnect")
+        elif self.connection_state == "disconnected":
+            self.start_connection()
+
+    def start_connection(self, credentials=None):
+        if self.connection_state != "disconnected" or self._closing:
+            return
+        try:
+            url = room_url(self.url_input.room_url.get())
+        except ValueError as error:
+            self.connection_label.configure(text=str(error))
+            return
+        self.hide_login()
+        self.login_button.grid_remove()
+        self.set_connection_state("connecting", "バックグラウンドで接続中…")
+        self.connection.submit("connect", url, credentials)
+
+    def poll_connection(self):
+        self._connection_poll = None
+        if self._closing:
+            thread = self.connection.thread
+            if thread is None or not thread.is_alive():
+                self.destroy()
+                return
+        else:
+            while True:
+                try:
+                    event = self.connection.events.get_nowait()
+                except Empty:
+                    break
+                self.set_connection_state(event.state, event.message)
+                if event.login_available:
+                    self.login_button.grid()
+                else:
+                    self.login_button.grid_remove()
+        self._connection_poll = self.after(100, self.poll_connection)
+
+    def show_login(self):
+        if self.connection_state != "disconnected" or self.login_panel is not None:
+            return
+        self.login_panel = customtkinter.CTkFrame(self, border_width=1, corner_radius=12)
+        self.login_panel.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.65)
+        self.login_panel.grid_columnconfigure(0, weight=1)
+        customtkinter.CTkLabel(self.login_panel, text="ココフォリアへログイン（任意）", font=(FONT_TYPE, 18, "bold")).grid(row=0, column=0, padx=24, pady=(20, 8), sticky="w")
+        customtkinter.CTkLabel(
+            self.login_panel, text="メールアドレス認証のみ対応。SNS・追加認証には未対応です。\nパスワードは保存せず、切断するとログイン状態も破棄します。",
+            justify="left", wraplength=420,
+        ).grid(row=1, column=0, padx=24, sticky="w")
+        self.login_email = customtkinter.CTkEntry(self.login_panel, placeholder_text="メールアドレス", height=36)
+        self.login_email.grid(row=2, column=0, padx=24, pady=(16, 8), sticky="ew")
+        self.login_password = customtkinter.CTkEntry(self.login_panel, placeholder_text="パスワード", show="●", height=36)
+        self.login_password.grid(row=3, column=0, padx=24, pady=8, sticky="ew")
+        self.login_error = customtkinter.CTkLabel(self.login_panel, text="", text_color="#FF7B72")
+        self.login_error.grid(row=4, column=0, padx=24, sticky="w")
+        actions = customtkinter.CTkFrame(self.login_panel, fg_color="transparent")
+        actions.grid(row=5, column=0, padx=24, pady=(0, 20), sticky="e")
+        customtkinter.CTkButton(actions, text="キャンセル", width=100, command=self.hide_login).pack(side="left", padx=8)
+        customtkinter.CTkButton(actions, text="ログインして接続", width=150, command=self.login_and_connect).pack(side="left")
+        self.login_password.bind("<Return>", lambda _event: self.login_and_connect())
+        self.login_email.focus_set()
+
+    def hide_login(self):
+        if self.login_panel is not None:
+            self.login_password.delete(0, "end")
+            self.login_email.delete(0, "end")
+            self.login_panel.destroy()
+            self.login_panel = None
+
+    def login_and_connect(self):
+        if self.login_panel is None:
+            return
+        email, password = self.login_email.get().strip(), self.login_password.get()
+        if not email or not password:
+            self.login_error.configure(text="メールアドレスとパスワードを入力してください。")
+            return
+        self.start_connection((email, password))
 
     def save_project(self):
         path = None
@@ -472,8 +775,19 @@ class App(customtkinter.CTk):
             self.set_project(ProjectStore())
 
     def close_app(self):
-        if self.confirm_project():
-            self.destroy()
+        if not self._closing and self.confirm_project():
+            self.hide_login()
+            self._closing = True
+            self.set_connection_state("disconnecting", "接続を終了しています…")
+            self.withdraw()  # 保存確認後、終了待ちの間に再編集されるのを防ぐ。
+            self.connection.close()
+
+    def destroy(self):
+        self.connection.close()
+        if self._connection_poll is not None:
+            self.after_cancel(self._connection_poll)
+            self._connection_poll = None
+        super().destroy()
 
     def move_node(self, source, target, position):
         try:
@@ -486,21 +800,25 @@ class App(customtkinter.CTk):
 
     def context_menu(self, node, event):
         parent = node if node and node.is_directory else (node.parent if node else None)
-        menu = tk.Menu(self, tearoff=False)
-        menu.add_command(label="新規ファイル", command=lambda: self.create_node(parent, TreeNode.FILE))
-        menu.add_command(label="新規ディレクトリ", command=lambda: self.create_node(parent, TreeNode.DIRECTORY))
+        if self.context_popup is not None and self.context_popup.winfo_exists():
+            self.context_popup.destroy()
+        location = parent.text if parent else "Projectルート"
+        items = [
+            ("＋  新規ファイル", lambda: self.create_node(parent, TreeNode.FILE)),
+            ("▰  新規ディレクトリ", lambda: self.create_node(parent, TreeNode.DIRECTORY)),
+        ]
         if parent:
-            menu.add_separator()
-            menu.add_command(label="ルートに新規ファイル", command=lambda: self.create_node(None, TreeNode.FILE))
-            menu.add_command(label="ルートに新規ディレクトリ", command=lambda: self.create_node(None, TreeNode.DIRECTORY))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+            items.extend([
+                None,
+                ("＋  ルートに新規ファイル", lambda: self.create_node(None, TreeNode.FILE)),
+                ("▰  ルートに新規ディレクトリ", lambda: self.create_node(None, TreeNode.DIRECTORY)),
+            ])
+        self.context_popup = ModernContextMenu(
+            self, f"作成先: {location}", items, event.x_root, event.y_root
+        )
 
     def create_node(self, parent, kind):
-        label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
-        name = simpledialog.askstring(f"新規{label}", f"{label}名", parent=self)
+        name = ModernNameDialog.ask(self, kind)
         if name is None:
             return
         try:
@@ -524,12 +842,9 @@ class ChoosePjFile(customtkinter.CTkFrame):
 
 class UrlInput:
     """Appとグリッド列を共有し、編集欄／操作欄の幅を揃える。"""
-    def __init__(self, master, fonts, control_width):
+    def __init__(self, master, fonts, control_width, command):
         self.room_url = customtkinter.CTkEntry(master, placeholder_text="CCFoliaのルームURLを入力", font=fonts)
-        self.room_connect = customtkinter.CTkButton(master, text="接続", command=self.room_connect_callback, width=control_width)
-
-    def room_connect_callback(self):
-        print(f"接続ボタンが押されました。入力されたURL: {self.room_url.get()}")
+        self.room_connect = customtkinter.CTkButton(master, text="接続", command=command, width=control_width)
 
 
 class TreeNode:
