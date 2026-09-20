@@ -1,11 +1,10 @@
-import contextlib
-import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from ccfolia_connection import ConnectionEvent
 
 import main
 from main import App, ProjectStore, TreeNode
@@ -134,6 +133,9 @@ class EditorTests(unittest.TestCase):
         cls.app.destroy()
 
     def setUp(self):
+        self.app.hide_login()
+        self.app.set_connection_state('disconnected', '未接続')
+        self.app.login_button.grid_remove()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.project = ProjectStore()
@@ -216,10 +218,13 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(self.folder.expanded)
         app.speaker.insert(0, 'actor')
         app.editor.insert('1.0', 'hello')
-        stream = io.StringIO()
-        with contextlib.redirect_stdout(stream):
+        app.set_connection_state('connected', '接続済み')
+        with patch.object(app.connection, 'submit') as submit:
             app.send()
-        self.assertEqual(json.loads(stream.getvalue()), {'speaker': 'actor', 'text': 'hello'})
+            app.send()  # Double-clicks must not post twice.
+        submit.assert_called_once_with('send', {'speaker': 'actor', 'text': 'hello'})
+        self.assertEqual(app.connection_state, 'sending')
+        self.assertEqual(app.payload()['text'], 'hello')
 
     def test_dirty_editor_survives_move_and_saves_to_new_path(self):
         app = self.app
@@ -239,6 +244,60 @@ class EditorTests(unittest.TestCase):
         app.update()
         self.assertEqual(self.project.read_file(self.first)['text'], 'shortcut')
         self.assertFalse(app.is_dirty())
+
+    def test_connect_locks_url_until_disconnect_completes(self):
+        app = self.app
+        entry = app.url_input.room_url
+        entry.delete(0, 'end')
+        entry.insert(0, 'https://ccfolia.com/rooms/example')
+        with patch.object(app.connection, 'submit') as submit:
+            app.toggle_connection()
+            app.toggle_connection()
+            submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example', None)
+            self.assertEqual(entry.cget('state'), 'disabled')
+            self.assertEqual(app.send_button.cget('state'), 'disabled')
+            app.connection.events.put(ConnectionEvent('connected', '接続済み'))
+            app.after_cancel(app._connection_poll)
+            app.poll_connection()
+            self.assertEqual(app.url_input.room_connect.cget('text'), '切断')
+            self.assertEqual(app.send_button.cget('state'), 'normal')
+            app.toggle_connection()
+            self.assertEqual(entry.cget('state'), 'disabled')
+            submit.assert_called_with('disconnect')
+            app.connection.events.put(ConnectionEvent('disconnected', '切断しました'))
+            app.after_cancel(app._connection_poll)
+            app.poll_connection()
+            self.assertEqual(entry.cget('state'), 'normal')
+            self.assertEqual(app.url_input.room_connect.cget('text'), '接続')
+
+    def test_optional_login_is_inline_and_credentials_cleared(self):
+        app = self.app
+        app.url_input.room_url.delete(0, 'end')
+        app.url_input.room_url.insert(0, 'https://ccfolia.com/rooms/example')
+        app.set_connection_state('connecting', '接続中')
+        app.connection.events.put(ConnectionEvent('disconnected', '投稿権限なし', True))
+        app.after_cancel(app._connection_poll)
+        app.poll_connection()
+        self.assertEqual(app.url_input.room_url.cget('state'), 'normal')
+        self.assertIsNone(app.login_panel)
+        app.show_login()
+        self.assertIs(app.login_panel.winfo_toplevel(), app)
+        app.login_email.insert(0, 'user@example.invalid')
+        app.login_password.insert(0, 'test-only-password')
+        with patch.object(app.connection, 'submit') as submit:
+            app.login_and_connect()
+        submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example',
+                                       ('user@example.invalid', 'test-only-password'))
+        self.assertIsNone(app.login_panel)
+
+    def test_invalid_url_does_not_connect(self):
+        app = self.app
+        app.url_input.room_url.delete(0, 'end')
+        app.url_input.room_url.insert(0, 'https://example.com')
+        with patch.object(app.connection, 'submit') as submit:
+            app.toggle_connection()
+        submit.assert_not_called()
+        self.assertEqual(app.url_input.room_url.cget('state'), 'normal')
 
     def test_modern_creation_ui(self):
         app = self.app
