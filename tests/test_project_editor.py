@@ -135,7 +135,6 @@ class EditorTests(unittest.TestCase):
     def setUp(self):
         self.app.hide_login()
         self.app.set_connection_state('disconnected', '未接続')
-        self.app.login_button.grid_remove()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.project = ProjectStore()
@@ -345,6 +344,44 @@ class EditorTests(unittest.TestCase):
         submit.assert_called_once_with('connect', 'https://ccfolia.com/rooms/example/chat',
                                        ('user@example.invalid', 'test-only-password'))
         self.assertIsNone(app.login_panel)
+
+    def test_login_button_opens_before_any_connection_attempt(self):
+        app = self.app
+        app.update()
+        self.assertTrue(app.login_button.winfo_ismapped())
+        self.assertEqual(app.login_button.cget('state'), 'normal')
+        with patch.object(app.connection, 'submit') as submit:
+            app.login_button.invoke()
+            self.assertIsNotNone(app.login_panel)
+            self.assertIs(app.login_panel.winfo_toplevel(), app)
+            app.hide_login()
+        submit.assert_not_called()
+
+    def test_login_button_disabled_until_disconnected(self):
+        app = self.app
+        for state in ('connecting', 'connected', 'sending', 'disconnecting'):
+            app.set_connection_state(state, '')
+            app.update()
+            self.assertTrue(app.login_button.winfo_ismapped())
+            self.assertEqual(app.login_button.cget('state'), 'disabled')
+            app.login_button.invoke()
+            self.assertIsNone(app.login_panel)
+        app.connection.events.put(ConnectionEvent('disconnected', '通信エラー', False))
+        app.after_cancel(app._connection_poll)
+        app.poll_connection()
+        self.assertEqual(app.login_button.cget('state'), 'normal')
+
+    def test_optional_login_invalid_url_shows_inline_error(self):
+        app = self.app
+        app.url_input.room_url.delete(0, 'end')
+        app.login_button.invoke()
+        app.login_email.insert(0, 'user@example.invalid')
+        app.login_password.insert(0, 'test-only')
+        with patch.object(app.connection, 'submit') as submit:
+            app.login_and_connect()
+        submit.assert_not_called()
+        self.assertIsNotNone(app.login_panel)
+        self.assertIn('https://ccfolia.com', app.login_error.cget('text'))
 
     def test_chat_url_is_not_appended_twice(self):
         for suffix in ('/chat', '/chat/'):
