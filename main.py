@@ -511,7 +511,6 @@ class App(customtkinter.CTk):
             controls, text="ログイン（任意）", width=self.CONTROL_WIDTH, command=self.show_login
         )
         self.login_button.grid(row=7, column=0, sticky="ew", pady=8)
-        self.login_button.grid_remove()
         self.editor.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.bind("<Control-s>", self.save_shortcut, add="+")
@@ -720,6 +719,7 @@ class App(customtkinter.CTk):
         self.url_input.room_connect.configure(
             text=labels[state], state="normal" if state in ("disconnected", "connected") else "disabled"
         )
+        self.login_button.configure(state="normal" if state == "disconnected" else "disabled")
         self.update_status()
 
     def toggle_connection(self):
@@ -738,9 +738,10 @@ class App(customtkinter.CTk):
                 url += "/chat"
         except ValueError as error:
             self.connection_label.configure(text=str(error))
+            if self.login_panel is not None:
+                self.login_error.configure(text=str(error))
             return
         self.hide_login()
-        self.login_button.grid_remove()
         self.set_connection_state("connecting", "バックグラウンドで接続中…")
         self.connection.submit("connect", url, credentials)
 
@@ -758,21 +759,17 @@ class App(customtkinter.CTk):
                 except Empty:
                     break
                 self.set_connection_state(event.state, event.message)
-                if event.login_available:
-                    self.login_button.grid()
-                else:
-                    self.login_button.grid_remove()
         self._connection_poll = self.after(100, self.poll_connection)
 
     def show_login(self):
-        if self.connection_state != "disconnected" or self.login_panel is not None:
+        if self._closing or self.connection_state != "disconnected" or self.login_panel is not None:
             return
         self.login_panel = customtkinter.CTkFrame(self, border_width=1, corner_radius=12)
         self.login_panel.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.65)
         self.login_panel.grid_columnconfigure(0, weight=1)
         customtkinter.CTkLabel(self.login_panel, text="ココフォリアへログイン（任意）", font=(FONT_TYPE, 18, "bold")).grid(row=0, column=0, padx=24, pady=(20, 8), sticky="w")
         customtkinter.CTkLabel(
-            self.login_panel, text="メールアドレス認証のみ対応。SNS・追加認証には未対応です。\nパスワードは保存せず、切断するとログイン状態も破棄します。",
+            self.login_panel, text="上部のルームURLへログインして接続します。\nメールアドレス認証のみ対応。SNS・追加認証には未対応です。\nパスワードは保存せず、切断するとログイン状態も破棄します。",
             justify="left", wraplength=420,
         ).grid(row=1, column=0, padx=24, sticky="w")
         self.login_email = customtkinter.CTkEntry(self.login_panel, placeholder_text="メールアドレス", height=36)
