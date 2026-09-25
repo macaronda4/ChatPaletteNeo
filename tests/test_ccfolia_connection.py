@@ -73,6 +73,36 @@ class AdapterTests(unittest.TestCase):
         # Exactly one submit click; no second submit.
         self.assertEqual(page.get_by_role.return_value.click.call_count, 1)
 
+    def test_blank_speaker_and_tab_use_defaults(self):
+        self.client.page.locator.return_value.input_value.return_value = 'KP'
+        self.client.page.get_by_placeholder.return_value.input_value.return_value = 'hello'
+        with patch.object(self.client, 'alive', return_value=True), \
+                patch.object(self.client, '_select_tab') as select:
+            self.client.send({'speaker': '  ', 'text': 'hello', 'tab': ' '})
+        select.assert_called_once_with('メイン')
+        self.client.page.locator.return_value.fill.assert_called_once_with('KP')
+
+    def test_custom_tab_selected_by_exact_label(self):
+        self.client._select_tab('情報')
+        page = self.client.page
+        page.get_by_text.assert_any_call('情報', exact=True)
+        target = page.get_by_role.return_value.locator.return_value.filter.return_value
+        target.click.assert_called_once()
+        self.api.expect.return_value.to_have_attribute.assert_called_once_with(
+            'aria-selected', 'true', timeout=8000)
+
+    def test_missing_custom_tab_never_falls_back_or_sends(self):
+        self.api.expect.return_value.to_have_count.side_effect = TimeoutError()
+        target = self.client.page.get_by_role.return_value.locator.return_value.filter.return_value
+        target.count.return_value = 0
+        with patch.object(self.client, 'alive', return_value=True), \
+                patch.object(self.client, '_main_tab') as main_tab:
+            with self.assertRaises(ConnectionProblem):
+                self.client.send({'speaker': '', 'text': 'hello', 'tab': '不存在'})
+        main_tab.assert_not_called()
+        target.click.assert_not_called()
+        self.client.page.get_by_placeholder.return_value.fill.assert_not_called()
+
     def test_missing_or_ambiguous_tab_reports_counts_without_clicking(self):
         for candidates in (0, 2):
             with self.subTest(candidates=candidates):
