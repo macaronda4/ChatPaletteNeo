@@ -9,7 +9,10 @@ from tkinter import filedialog, messagebox
 import customtkinter
 from ccfolia_connection import ConnectionWorker, room_url
 
-FONT_TYPE = "meiryo"
+FONT_TYPE = "BIZ UDPGothic"
+
+# Explicit tuples and theme defaults both use regular UDP Gothic.
+customtkinter.ThemeManager.theme["CTkFont"].update(family=FONT_TYPE, weight="normal")
 
 
 def atomic_json(path, data):
@@ -117,14 +120,18 @@ class ProjectStore:
 
     def read_file(self, node):
         if node in self.pending:
-            return dict(self.pending[node])
-        with self.disk_path(node).open(encoding="utf-8") as stream:
-            payload = json.load(stream)
+            payload = dict(self.pending[node])
+        else:
+            with self.disk_path(node).open(encoding="utf-8") as stream:
+                payload = json.load(stream)
         if not isinstance(payload, dict) or not all(
             isinstance(payload.get(key), str) for key in ("speaker", "text")
         ):
             raise ValueError("JSONには文字列のspeakerとtextが必要です。")
-        return {"speaker": payload["speaker"], "text": payload["text"]}
+        if not isinstance(payload.get("tab", "メイン"), str):
+            raise ValueError("送信タブ（tab）は文字列で指定してください。")
+        return {"speaker": payload["speaker"], "text": payload["text"],
+                "tab": payload.get("tab", "メイン")}
 
     def save_file(self, node, payload):
         if self.path is None:
@@ -185,7 +192,7 @@ class ProjectStore:
             if self.path and self.disk_path(node).exists():
                 raise FileExistsError("同名のファイルまたはディレクトリが既に存在します。")
             if node.is_file:
-                self.pending[node] = {"speaker": "", "text": ""}
+                self.pending[node] = {"speaker": "", "text": "", "tab": "メイン"}
             self.dirty = True
             if self.path:
                 self.save()
@@ -197,6 +204,59 @@ class ProjectStore:
         if parent is not None:
             parent.expanded = True
         return node
+
+    def rename(self, node, name):
+        name = name.strip()
+        self.validate_name(name)
+        if node.is_file and not name.lower().endswith(".json"):
+            name += ".json"
+        old_name, old_dirty = node.text, self.dirty
+        old_path = self.disk_path(node) if self.path else None
+        if name == old_name:
+            return
+        node.text = name
+        moved = False
+        try:
+            self.validate()
+            if self.path:
+                new_path = self.disk_path(node)
+                if new_path.exists():
+                    raise FileExistsError("同名のファイルまたはディレクトリが既に存在します。")
+                old_path.rename(new_path)
+                moved = True
+                self.save()
+            else:
+                self.dirty = True
+        except Exception:
+            if moved:
+                new_path.rename(old_path)
+            node.text, self.dirty = old_name, old_dirty
+            raise
+
+    def delete_file(self, node):
+        if not node.is_file:
+            raise ValueError("削除できるのはファイルのみです。")
+        siblings = self.roots if node.parent is None else node.parent.children
+        index = siblings.index(node)
+        old_dirty = self.dirty
+        if self.path is None:
+            siblings.pop(index)
+            self.pending.pop(node, None)
+            self.dirty = True
+            return
+        path = self.disk_path(node)
+        # Keep the original until the updated CPN has been written successfully.
+        with tempfile.TemporaryDirectory(prefix=".cpn-delete-", dir=path.parent) as folder:
+            backup = Path(folder) / path.name
+            path.rename(backup)
+            siblings.pop(index)
+            try:
+                self.save()
+            except Exception:
+                siblings.insert(index, node)
+                backup.rename(path)
+                self.dirty = old_dirty
+                raise
 
     def move(self, source, target, position):
         if target is source or (target and source.is_ancestor_of(target)):
@@ -330,13 +390,14 @@ class ModernContextMenu(customtkinter.CTkToplevel):
 class ModernNameDialog(customtkinter.CTkToplevel):
     """ファイル／ディレクトリ名を入力するモーダルダイアログ。"""
 
-    def __init__(self, master, kind):
+    def __init__(self, master, kind, initial_name=None):
         super().__init__(master)
         self.result = None
         self.kind = kind
         label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
 
-        self.title(f"新規{label}")
+        title = f"{label}名変更" if initial_name is not None else f"新規{label}"
+        self.title(title)
         self.geometry("420x210")
         self.resizable(False, False)
         self.transient(master)
@@ -345,9 +406,9 @@ class ModernNameDialog(customtkinter.CTkToplevel):
 
         customtkinter.CTkLabel(
             self,
-            text=f"新規{label}",
+            text=title,
             anchor="w",
-            font=(FONT_TYPE, 20, "bold"),
+            font=(FONT_TYPE, 20, "normal"),
         ).grid(row=0, column=0, padx=24, pady=(22, 4), sticky="ew")
 
         content = customtkinter.CTkFrame(self, fg_color="transparent")
@@ -368,6 +429,9 @@ class ModernNameDialog(customtkinter.CTkToplevel):
             font=(FONT_TYPE, 14),
         )
         self.entry.grid(row=1, column=0, pady=(5, 2), sticky="ew")
+        if initial_name is not None:
+            self.entry.insert(0, initial_name)
+            self.entry.select_range(0, "end")
         self.error_label = customtkinter.CTkLabel(
             content,
             text="",
@@ -391,7 +455,7 @@ class ModernNameDialog(customtkinter.CTkToplevel):
         ).grid(row=0, column=0, padx=(0, 8))
         customtkinter.CTkButton(
             actions,
-            text="作成",
+            text="変更" if initial_name is not None else "作成",
             width=100,
             command=self.submit,
         ).grid(row=0, column=1)
@@ -425,8 +489,8 @@ class ModernNameDialog(customtkinter.CTkToplevel):
         return "break"
 
     @classmethod
-    def ask(cls, master, kind):
-        dialog = cls(master, kind)
+    def ask(cls, master, kind, initial_name=None):
+        dialog = cls(master, kind, initial_name)
         master.wait_window(dialog)
         return dialog.result
 
@@ -453,8 +517,8 @@ class App(customtkinter.CTk):
 
     def setup_form(self):
         customtkinter.set_appearance_mode("dark")
-        self.geometry("1000x500")
-        self.minsize(760, 400)
+        self.geometry("1000x600")
+        self.minsize(760, 560)
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(1, weight=1)
         self.grid_columnconfigure(2, minsize=self.CONTROL_WIDTH + 20)
@@ -492,25 +556,31 @@ class App(customtkinter.CTk):
         self._speaker_index = 0
         self._speaker_replaying = False
         self.speaker = customtkinter.CTkEntry(
-            controls, placeholder_text="話者", width=self.CONTROL_WIDTH,
+            controls, placeholder_text="話者（空欄: KP）", width=self.CONTROL_WIDTH,
             font=self.fonts, textvariable=self._speaker_var
         )
         self._speaker_var.trace_add("write", self.record_speaker_edit)
         self.speaker.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.send_tab = customtkinter.CTkEntry(
+            controls, placeholder_text="送信タブ（メイン）", width=self.CONTROL_WIDTH,
+            font=self.fonts,
+        )
+        self.send_tab.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         self.previous_button = customtkinter.CTkButton(controls, text="前へ", command=lambda: self.navigate(-1), width=self.CONTROL_WIDTH)
         self.next_button = customtkinter.CTkButton(controls, text="次へ", command=lambda: self.navigate(1), width=self.CONTROL_WIDTH)
         self.save_button = customtkinter.CTkButton(controls, text="保存", command=self.save_current, width=self.CONTROL_WIDTH)
         self.send_button = customtkinter.CTkButton(controls, text="送信", command=self.send, width=self.CONTROL_WIDTH)
-        for row, button in enumerate((self.previous_button, self.next_button, self.save_button, self.send_button), 1):
+        for row, button in enumerate((self.previous_button, self.next_button, self.save_button, self.send_button), 2):
             button.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         self.current_label = customtkinter.CTkLabel(controls, text="ファイル未選択", wraplength=140, justify="left")
-        self.current_label.grid(row=5, column=0, sticky="ew")
+        self.current_label.grid(row=6, column=0, sticky="ew")
         self.connection_label = customtkinter.CTkLabel(controls, text="未接続", wraplength=140, justify="left")
-        self.connection_label.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        self.connection_label.grid(row=7, column=0, sticky="ew", pady=(12, 0))
         self.login_button = customtkinter.CTkButton(
             controls, text="ログイン（任意）", width=self.CONTROL_WIDTH, command=self.show_login
         )
-        self.login_button.grid(row=7, column=0, sticky="ew", pady=8)
+        self.login_button.grid(row=8, column=0, sticky="ew", pady=8)
+        self.send_tab.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.editor.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.bind("<Control-s>", self.save_shortcut, add="+")
@@ -563,7 +633,8 @@ class App(customtkinter.CTk):
         return "break"
 
     def payload(self):
-        return {"speaker": self.speaker.get(), "text": self.editor.get("1.0", "end-1c")}
+        return {"speaker": self.speaker.get(), "text": self.editor.get("1.0", "end-1c"),
+                "tab": self.send_tab.get()}
 
     def is_dirty(self):
         return self.current_node is not None and self.payload() != self.saved_payload
@@ -586,11 +657,14 @@ class App(customtkinter.CTk):
         self.tree.selected_node = None
         self.editor.configure(state="normal")
         self.speaker.configure(state="normal")
+        self.send_tab.configure(state="normal")
+        self.send_tab.delete(0, "end")
         self.editor.delete("1.0", "end")
         self.speaker.delete(0, "end")
         self.reset_edit_history()
         self.editor.configure(state="disabled")
         self.speaker.configure(state="disabled")
+        self.send_tab.configure(state="disabled")
         self.save_button.configure(state="disabled")
         self.send_button.configure(state="disabled")
         self.current_label.configure(text="ファイル未選択")
@@ -634,6 +708,9 @@ class App(customtkinter.CTk):
         self.saved_payload = dict(payload)
         self.editor.configure(state="normal")
         self.speaker.configure(state="normal")
+        self.send_tab.configure(state="normal")
+        self.send_tab.delete(0, "end")
+        self.send_tab.insert(0, payload["tab"])
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", payload["text"])
         self.speaker.delete(0, "end")
@@ -689,9 +766,11 @@ class App(customtkinter.CTk):
         if self.current_node is None or self.connection_state != "connected":
             return
         payload = self.payload()
-        if not payload["text"].strip() or not payload["speaker"].strip():
-            self.connection_label.configure(text="話者と本文を入力してください。")
+        if not payload["text"].strip():
+            self.connection_label.configure(text="本文を入力してください。")
             return
+        payload["speaker"] = payload["speaker"] if payload["speaker"].strip() else "KP"
+        payload["tab"] = payload["tab"].strip() or "メイン"
         self.set_connection_state("sending", "送信中…")
         self.connection.submit("send", payload)
 
@@ -767,7 +846,7 @@ class App(customtkinter.CTk):
         self.login_panel = customtkinter.CTkFrame(self, border_width=1, corner_radius=12)
         self.login_panel.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.65)
         self.login_panel.grid_columnconfigure(0, weight=1)
-        customtkinter.CTkLabel(self.login_panel, text="ココフォリアへログイン（任意）", font=(FONT_TYPE, 18, "bold")).grid(row=0, column=0, padx=24, pady=(20, 8), sticky="w")
+        customtkinter.CTkLabel(self.login_panel, text="ココフォリアへログイン（任意）", font=(FONT_TYPE, 18, "normal")).grid(row=0, column=0, padx=24, pady=(20, 8), sticky="w")
         customtkinter.CTkLabel(
             self.login_panel, text="上部のルームURLへログインして接続します。\nメールアドレス認証のみ対応。SNS・追加認証には未対応です。\nパスワードは保存せず、切断するとログイン状態も破棄します。",
             justify="left", wraplength=420,
@@ -882,6 +961,8 @@ class App(customtkinter.CTk):
         if node and node.is_file:
             items[0:0] = [
                 ("送信", lambda: self.send_file(node), self.connection_state == "connected"),
+                ("ファイル名変更", lambda: self.rename_file(node)),
+                ("ファイル削除", lambda: self.delete_file(node)),
                 None,
             ]
         if parent:
@@ -893,6 +974,34 @@ class App(customtkinter.CTk):
         self.context_popup = ModernContextMenu(
             self, f"作成先: {location}", items, event.x_root, event.y_root
         )
+
+    def rename_file(self, node):
+        name = ModernNameDialog.ask(self, TreeNode.FILE, initial_name=node.text)
+        if name is None:
+            return
+        try:
+            self.project.rename(node, name)
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+            return
+        self.tree.refresh()
+        self.update_status()
+
+    def delete_file(self, node):
+        warning = "\n編集中の未保存の変更も削除されます。" if node is self.current_node and self.is_dirty() else ""
+        if not messagebox.askyesno(
+            "ファイル削除", f"{node.text} を削除しますか？\n実ファイルも削除されます。{warning}", parent=self
+        ):
+            return
+        try:
+            self.project.delete_file(node)
+        except (OSError, ValueError) as error:
+            self.report_error(error)
+            return
+        if node is self.current_node:
+            self.clear_editor()
+        self.tree.refresh()
+        self.update_status()
 
     def create_node(self, parent, kind):
         name = ModernNameDialog.ask(self, kind)

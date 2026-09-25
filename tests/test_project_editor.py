@@ -18,7 +18,7 @@ class ProjectTests(unittest.TestCase):
         self.project = ProjectStore()
         self.folder = self.project.create(None, 'シーン', TreeNode.DIRECTORY)
         self.file = self.project.create(self.folder, '台詞', TreeNode.FILE)
-        self.payload = {'speaker': 'まかろん', 'text': 'こんにちは\n次の行'}
+        self.payload = {'speaker': 'まかろん', 'text': 'こんにちは\n次の行', 'tab': 'メイン'}
         self.project.save_file(self.file, self.payload)
 
     def test_project_and_file_round_trip(self):
@@ -28,6 +28,48 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(loaded.data(), self.project.data())
         self.assertEqual(loaded.read_file(loaded.roots[0].children[0]), self.payload)
         self.assertEqual(loaded.data()[0]['children'][0]['data']['path'], 'シーン/台詞.json')
+
+    def test_rename_delete_and_legacy_tab_round_trip(self):
+        self.project.save(self.path)
+        self.project.rename(self.file, '変更後')
+        self.assertFalse((self.path.parent / 'シーン/台詞.json').exists())
+        self.assertEqual(self.project.read_file(self.file), self.payload)
+        self.assertEqual(ProjectStore.load(self.path).data(), self.project.data())
+        self.project.save_file(self.file, {'speaker': '', 'text': 'legacy'})
+        self.assertEqual(self.project.read_file(self.file)['tab'], 'メイン')
+        self.project.delete_file(self.file)
+        self.assertEqual(self.folder.children, [])
+        self.assertFalse((self.path.parent / 'シーン/変更後.json').exists())
+        self.assertEqual(ProjectStore.load(self.path).data(), self.project.data())
+
+    def test_file_actions_roll_back_if_project_save_fails(self):
+        self.project.save(self.path)
+        before = self.path.read_bytes()
+        for action in (lambda: self.project.rename(self.file, 'renamed'),
+                       lambda: self.project.delete_file(self.file)):
+            with patch('main.atomic_json', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    action()
+            self.assertEqual(self.file.text, '台詞.json')
+            self.assertEqual(self.folder.children, [self.file])
+            self.assertEqual(self.project.read_file(self.file), self.payload)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_rename_collision_and_pending_file_actions(self):
+        other = self.project.create(self.folder, 'other', TreeNode.FILE)
+        with self.assertRaises(ValueError):
+            self.project.rename(self.file, 'other')
+        self.project.rename(self.file, 'renamed')
+        self.assertEqual(self.project.read_file(self.file), self.payload)
+        self.project.delete_file(other)
+        self.assertNotIn(other, self.project.pending)
+        self.project.save(self.path)
+        existing = self.path.parent / 'シーン/external.json'
+        existing.write_text('keep')
+        with self.assertRaises(FileExistsError):
+            self.project.rename(self.file, 'external')
+        self.assertEqual(existing.read_text(), 'keep')
+        self.assertEqual(self.project.read_file(self.file), self.payload)
 
     def test_saved_file_and_directory_moves(self):
         self.project.save(self.path)
@@ -49,7 +91,7 @@ class ProjectTests(unittest.TestCase):
             self.project.move(self.file, other, 'inside')
         self.assertIs(self.file.parent, self.folder)
         self.assertEqual(self.project.read_file(self.file), self.payload)
-        self.assertEqual(self.project.read_file(conflicting), {'speaker': '', 'text': ''})
+        self.assertEqual(self.project.read_file(conflicting), {'speaker': '', 'text': '', 'tab': 'メイン'})
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_move_rolls_back_when_project_write_fails(self):
@@ -221,7 +263,7 @@ class EditorTests(unittest.TestCase):
         with patch.object(app.connection, 'submit') as submit:
             app.send()
             app.send()  # Double-clicks must not post twice.
-        submit.assert_called_once_with('send', {'speaker': 'actor', 'text': 'hello'})
+        submit.assert_called_once_with('send', {'speaker': 'actor', 'text': 'hello', 'tab': 'メイン'})
         self.assertEqual(app.connection_state, 'sending')
         self.assertEqual(app.payload()['text'], 'hello')
 
@@ -233,6 +275,40 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(app.save_current())
         self.assertFalse((self.project.path.parent / 'first.json').exists())
         self.assertEqual(self.project.read_file(self.first)['text'], 'unsaved')
+
+    def test_rename_preserves_draft_and_delete_cancel_preserves_file(self):
+        app = self.app
+        app.editor.insert('1.0', 'draft')
+        with patch('main.ModernNameDialog.ask', return_value='renamed'):
+            app.rename_file(self.first)
+        self.assertEqual(app.editor.get('1.0', 'end-1c'), 'draft')
+        self.assertTrue(app.is_dirty())
+        self.assertEqual(self.first.text, 'renamed.json')
+        with patch('main.messagebox.askyesno', return_value=False):
+            app.delete_file(self.first)
+        self.assertTrue(self.project.disk_path(self.first).exists())
+        with patch('main.messagebox.askyesno', return_value=True):
+            app.delete_file(self.first)
+        self.assertIsNone(app.current_node)
+        self.assertNotIn(self.first, self.project.roots)
+
+    def test_tab_save_switch_and_send_defaults(self):
+        app = self.app
+        app.send_tab.delete(0, 'end')
+        app.send_tab.insert(0, '情報')
+        app.editor.insert('1.0', 'hello')
+        self.assertTrue(app.is_dirty())
+        app.save_current()
+        app.file_clicked(self.second)
+        app.file_clicked(self.first)
+        self.assertEqual(app.send_tab.get(), '情報')
+        app.send_tab.delete(0, 'end')
+        app.set_connection_state('connected', '')
+        with patch.object(app.connection, 'submit') as submit:
+            app.send()
+        submit.assert_called_once_with('send', {'speaker': 'KP', 'text': 'hello', 'tab': 'メイン'})
+        self.assertEqual(app.speaker.get(), '')
+        self.assertEqual(app.send_tab.get(), '')
 
     def test_control_s_saves_current_file(self):
         app = self.app
@@ -280,7 +356,7 @@ class EditorTests(unittest.TestCase):
     def test_file_switch_clears_both_edit_histories(self):
         self.app.editor.insert('1.0', 'old text')
         self.app.speaker.insert(0, 'old speaker')
-        payload = {'speaker': 'next speaker', 'text': 'next text'}
+        payload = {'speaker': 'next speaker', 'text': 'next text', 'tab': 'メイン'}
         self.project.save_file(self.second, payload)
         with patch('main.messagebox.askyesnocancel', return_value=False):
             self.app.file_clicked(self.second)
@@ -444,7 +520,7 @@ class EditorTests(unittest.TestCase):
                     if button.cget('text') == '送信')
 
     def test_context_send_uses_clicked_file(self):
-        payload = {'speaker': 'target', 'text': 'second file'}
+        payload = {'speaker': 'target', 'text': 'second file', 'tab': '情報'}
         self.project.save_file(self.second, payload)
         self.app.set_connection_state('connected', '')
         button = self.context_send_button(self.second)

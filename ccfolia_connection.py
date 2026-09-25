@@ -105,8 +105,18 @@ class HeadlessRoom:
         return self.page.locator('input[name="name"]')
 
     def _select_main_tab(self):
+        self._select_tab("メイン")
+
+    def _select_tab(self, tab_name):
         from playwright.sync_api import expect
-        tab = self._main_tab()
+        if tab_name == "メイン":
+            tab = self._main_tab()
+        else:
+            # Match the tab's label separately from its unread-count badge.
+            # Draggable custom tabs have role="button", not role="tab".
+            tab = self.page.get_by_role("tablist").locator("button[aria-selected]").filter(
+                has=self.page.get_by_text(tab_name, exact=True)
+            )
         try:
             self._dismiss_announcement()
             for attempt in range(2):
@@ -125,13 +135,13 @@ class HeadlessRoom:
         except Exception:
             if tab.count() == 1:
                 raise ConnectionProblem(
-                    "「メイン」の選択完了を確認できません。送信は行っていません。"
+                    f"「{tab_name}」の選択完了を確認できません。送信は行っていません。"
                 ) from None
             tabs = self.page.get_by_role("tab").and_(self.page.locator(":visible"))
             raise ConnectionProblem(
-                "送信先の「メイン」を特定できません。"
+                f"送信先の「{tab_name}」を特定できません。"
                 f"（表示中のtab要素: {tabs.count()}、"
-                f"id=mainの候補: {tab.count()}）"
+                f"一致する候補: {tab.count()}）"
                 "案内ダイアログや画面構造を確認してください。送信は行っていません。"
             ) from None
 
@@ -182,11 +192,12 @@ class HeadlessRoom:
         if not self.alive():
             raise ConnectionProblem("接続が失われています。再接続してください。")
         text = payload["text"]
-        speaker = payload["speaker"]
-        if not text.strip() or not speaker.strip():
-            raise ConnectionProblem("話者と本文を入力してください。")
+        speaker = payload["speaker"] if payload["speaker"].strip() else "KP"
+        tab_name = payload.get("tab", "").strip() or "メイン"
+        if not text.strip():
+            raise ConnectionProblem("本文を入力してください。")
         try:
-            self._select_main_tab()
+            self._select_tab(tab_name)
             name = self._speaker_box()
             name.fill(speaker)
             name.press("Tab")
@@ -278,7 +289,7 @@ class ConnectionWorker:
                             backend.close()
                         backend = self.backend_factory()
                         backend.connect(*args)
-                        self.events.put(ConnectionEvent("connected", "接続済み・送信先: メイン"))
+                        self.events.put(ConnectionEvent("connected", "接続済み"))
                     except Exception as error:
                         if backend:
                             backend.close()
