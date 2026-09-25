@@ -1,4 +1,5 @@
 import json
+from bisect import bisect_right
 import math
 import os
 from pathlib import Path
@@ -642,19 +643,27 @@ class App(customtkinter.CTk):
     def update_status(self):
         dirty = self.is_dirty()
         project_name = self.project.path.name if self.project.path else "新規Project"
-        self.title(f"{'* ' if dirty else ''}Chat Palette NEO — {project_name}")
-        self.project_button.configure(text="Project保存" + (" *" if self.project.dirty else ""))
+        title = f"{'* ' if dirty else ''}Chat Palette NEO — {project_name}"
+        if self.title() != title:
+            self.title(title)
+        self.configure_changed(self.project_button, text="Project保存" + (" *" if self.project.dirty else ""))
         if self.current_node:
-            self.current_label.configure(text=f"{self.current_node.text}\n" + ("未保存" if dirty else "保存済み"))
+            self.configure_changed(self.current_label, text=f"{self.current_node.text}\n" + ("未保存" if dirty else "保存済み"))
         files = [n for n in self.project.walk() if n.is_file]
         index = files.index(self.current_node) if self.current_node in files else -1
-        self.previous_button.configure(state="normal" if index > 0 else "disabled")
-        self.next_button.configure(state="normal" if 0 <= index < len(files) - 1 else "disabled")
-        self.send_button.configure(state="normal" if self.current_node and self.connection_state == "connected" else "disabled")
+        self.configure_changed(self.previous_button, state="normal" if index > 0 else "disabled")
+        self.configure_changed(self.next_button, state="normal" if 0 <= index < len(files) - 1 else "disabled")
+        self.configure_changed(self.send_button, state="normal" if self.current_node and self.connection_state == "connected" else "disabled")
+
+    @staticmethod
+    def configure_changed(widget, **options):
+        changes = {key: value for key, value in options.items() if widget.cget(key) != value}
+        if changes:
+            widget.configure(**changes)
 
     def clear_editor(self):
         self.current_node = None
-        self.tree.selected_node = None
+        self.tree.select_node(None)
         self.editor.configure(state="normal")
         self.speaker.configure(state="normal")
         self.send_tab.configure(state="normal")
@@ -718,12 +727,15 @@ class App(customtkinter.CTk):
         self.reset_edit_history()
         self.save_button.configure(state="normal")
         self.send_button.configure(state="normal")
-        self.tree.selected_node = node
+        self.tree.select_node(node)
         ancestor = node.parent
+        expanded = False
         while ancestor:
+            expanded = expanded or not ancestor.expanded
             ancestor.expanded = True
             ancestor = ancestor.parent
-        self.tree.refresh()
+        if expanded:
+            self.tree.refresh()
         self.tree.after_idle(lambda: self.tree.reveal(node))
         self.update_status()
 
@@ -1147,6 +1159,8 @@ class TreeItem(customtkinter.CTkFrame):
         self._hovered = False
         self._drop_inside = False
         self._hover_job = None
+        self._style = None
+        self._row = None
 
         self.grid_columnconfigure(3, weight=1)
 
@@ -1265,17 +1279,29 @@ class TreeItem(customtkinter.CTkFrame):
 
     def update_style(self):
         if self._drop_inside:
-            self.configure(
-                fg_color=self.DROP_COLOR,
-                border_width=2,
-                border_color="#3B8ED0"
-            )
+            style = (self.DROP_COLOR, 2)
         elif self.tree.selected_node is self.node:
-            self.configure(fg_color=self.SELECTED_COLOR, border_width=2, border_color="#3B8ED0")
+            style = (self.SELECTED_COLOR, 2)
         elif self._hovered:
-            self.configure(fg_color=self.HOVER_COLOR, border_width=0)
+            style = (self.HOVER_COLOR, 0)
         else:
-            self.configure(fg_color=self.NORMAL_COLOR, border_width=0)
+            style = (self.NORMAL_COLOR, 0)
+        if style != self._style:
+            self.configure(fg_color=style[0], border_width=style[1], border_color="#3B8ED0")
+            self._style = style
+
+    def update_node(self, depth, row):
+        if depth != self.depth:
+            self.depth = depth
+            self.indent.configure(width=depth * self.INDENT_WIDTH)
+        text = f"📁  {self.node.text}" if self.node.is_directory else self.node.text
+        App.configure_changed(self.label, text=text)
+        if self.node.is_directory:
+            App.configure_changed(self.icon, text=self.get_arrow())
+        if row != self._row:
+            self.grid(row=row, column=0, sticky="ew", padx=6, pady=2)
+            self._row = row
+        self.update_style()
 
     def set_inside_highlight(self, enabled):
         self._drop_inside = enabled
@@ -1358,6 +1384,11 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         self.hover_node = None
         self.drop_position = None
         self.drag_preview = None
+        self._drag_job = None
+        self._highlighted = None
+        self._hit_nodes = None
+        self._hit_bottoms = []
+        self.bind("<Configure>", self.invalidate_hit_cache, add="+")
 
         # CustomTkinterではwidth/heightをplace()ではなくWidget側に渡す。
         self.drop_indicator = customtkinter.CTkFrame(
@@ -1372,6 +1403,9 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
     def blank_context_menu(self, event):
         if self.on_context_menu:
             self.on_context_menu(None, event)
+
+    def invalidate_hit_cache(self, _event=None):
+        self._hit_nodes = None
 
     def reveal(self, node):
         frame = self.item_frames.get(node)
@@ -1410,24 +1444,33 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         node.parent = None
 
     def refresh(self):
+        self.clear_drop_highlights()
         self.hide_drop_indicator()
-        for frame in list(self.item_frames.values()):
-            frame.destroy()
-        self.item_frames.clear()
-
+        previous = self.item_frames
+        self.item_frames = {}
+        self._reusable_frames = previous
         row = 0
         for node in self.root_nodes:
             row = self.render_node(node, depth=0, row=row)
+        for frame in previous.values():
+            frame.destroy()
+        del self._reusable_frames
+        self._hit_nodes = None
+
+    def select_node(self, node):
+        previous = self.selected_node
+        if previous is node:
+            return
+        self.selected_node = node
+        for changed in (previous, node):
+            if changed in self.item_frames:
+                self.item_frames[changed].update_style()
 
     def render_node(self, node, depth, row):
-        item = TreeItem(self, self, node, depth)
-        item.grid(
-            row=row,
-            column=0,
-            sticky="ew",
-            padx=6,
-            pady=2
-        )
+        item = self._reusable_frames.pop(node, None)
+        if item is None:
+            item = TreeItem(self, self, node, depth)
+        item.update_node(depth, row)
         self.item_frames[node] = item
         row += 1
 
@@ -1454,12 +1497,31 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         if not self.drag_active and distance >= self.DRAG_THRESHOLD:
             self.begin_drag(node)
         if self.drag_active:
+            if self._drag_job is None:
+                self._drag_job = self.after(16, lambda: self.flush_drag(node))
+
+    def flush_drag(self, node):
+        self._drag_job = None
+        if self.drag_active:
             self.update_drag(node)
+
+    def cancel_drag_update(self):
+        if self._drag_job is not None:
+            self.after_cancel(self._drag_job)
+            self._drag_job = None
+
+    def destroy(self):
+        self.cancel_drag_update()
+        if self.drag_preview:
+            self.drag_preview.destroy()
+            self.drag_preview = None
+        super().destroy()
 
     def pointer_release(self, node):
         pressed = self.pressed_node
         self.pressed_node = None
         if self.drag_active:
+            self.cancel_drag_update()
             self.update_drag(node)
             self.finish_drag(node)
         elif pressed is node and node.is_file and self.on_file_click:
@@ -1471,6 +1533,7 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
     def begin_drag(self, node):
         self.drag_active = True
         self.dragged_node = node
+        self._hit_nodes = None
         self.hover_node = None
         self.drop_position = None
         self.drag_preview = DragPreview(self.winfo_toplevel(), node)
@@ -1483,32 +1546,30 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         if self.drag_preview:
             self.drag_preview.move(pointer_x, pointer_y)
 
-        self.clear_drop_highlights()
-        self.hide_drop_indicator()
-        self.hover_node = None
-        self.drop_position = None
         canvas = self._parent_canvas
+        target, position = None, None
         if not (canvas.winfo_rootx() <= pointer_x < canvas.winfo_rootx() + canvas.winfo_width()
                 and canvas.winfo_rooty() <= pointer_y < canvas.winfo_rooty() + canvas.winfo_height()):
+            pass
+        else:
+            target = self.get_node_under_mouse(pointer_y)
+            if target is None:
+                position = "root_end"
+            elif target is source or source.is_ancestor_of(target):
+                target = None
+            else:
+                position = self.get_drop_position(target, pointer_y)
+        if (target, position) == (self.hover_node, self.drop_position):
             return
-        target = self.get_node_under_mouse(pointer_y)
-
-        if target is None:
-            self.hover_node = None
-            self.drop_position = "root_end"
-            self.show_root_end_indicator()
-            return
-        if target is source or source.is_ancestor_of(target):
-            self.hover_node = None
-            self.drop_position = None
-            return
-
-        position = self.get_drop_position(target, pointer_y)
+        self.clear_drop_highlights()
+        self.hide_drop_indicator()
         self.hover_node = target
         self.drop_position = position
-
-        if position == "inside":
+        if position == "root_end":
+            self.show_root_end_indicator()
+        elif position == "inside":
             self.item_frames[target].set_inside_highlight(True)
+            self._highlighted = self.item_frames[target]
         elif position in ("before", "after"):
             self.show_drop_indicator(target, position)
 
@@ -1531,6 +1592,7 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         return "inside"
 
     def finish_drag(self, source):
+        self.cancel_drag_update()
         target = self.hover_node
         position = self.drop_position
 
@@ -1592,12 +1654,13 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
         self.call_on_change()
 
     def get_node_under_mouse(self, pointer_y):
-        for node, frame in self.item_frames.items():
-            top = frame.winfo_rooty()
-            # 行間の余白は次の行の「前」として扱う。
-            if pointer_y < top + frame.winfo_height():
-                return node
-        return None
+        if self._hit_nodes is None:
+            self.update_idletasks()
+            self._hit_nodes = list(self.item_frames)
+            self._hit_bottoms = [frame.winfo_y() + frame.winfo_height()
+                                 for frame in self.item_frames.values()]
+        index = bisect_right(self._hit_bottoms, pointer_y - self.winfo_rooty())
+        return self._hit_nodes[index] if index < len(self._hit_nodes) else None
 
     def show_drop_indicator(self, node, position):
         frame = self.item_frames.get(node)
@@ -1643,8 +1706,9 @@ class DragDropTree(customtkinter.CTkScrollableFrame):
             pass
 
     def clear_drop_highlights(self):
-        for frame in self.item_frames.values():
-            frame.set_inside_highlight(False)
+        if self._highlighted is not None:
+            self._highlighted.set_inside_highlight(False)
+            self._highlighted = None
 
     def get_data(self):
         return [node.to_dict() for node in self.root_nodes]

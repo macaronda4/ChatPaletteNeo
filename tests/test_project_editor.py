@@ -188,6 +188,62 @@ class EditorTests(unittest.TestCase):
         self.app.file_clicked(self.first)
         self.app.update()
 
+    def test_selection_reuses_rows_and_updates_only_selected_style(self):
+        app = self.app
+        frames = dict(app.tree.item_frames)
+        app.file_clicked(self.second)
+        app.update()
+        self.assertEqual(app.tree.item_frames, frames)
+        self.assertEqual(frames[self.second].cget('fg_color'), main.TreeItem.SELECTED_COLOR)
+        self.assertNotEqual(frames[self.first].cget('fg_color'), main.TreeItem.SELECTED_COLOR)
+
+    def test_refresh_reuses_rows_after_move_rename_and_collapse(self):
+        tree = self.app.tree
+        first = tree.item_frames[self.first]
+        second = tree.item_frames[self.second]
+        self.project.move(self.first, self.folder, 'inside')
+        tree.refresh()
+        self.app.update()
+        self.assertIs(tree.item_frames[self.first], first)
+        self.assertIs(tree.item_frames[self.second], second)
+        self.assertEqual(first.depth, 1)
+        self.assertEqual(list(tree.item_frames), [self.folder, self.second, self.first])
+        self.project.rename(self.first, 'changed')
+        tree.refresh()
+        self.assertEqual(first.label.cget('text'), 'changed.json')
+        self.folder.expanded = False
+        tree.refresh()
+        self.assertEqual(list(tree.item_frames), [self.folder])
+        self.app.file_clicked(self.second)
+        self.app.update()
+        self.assertIn(self.second, tree.item_frames)
+        self.assertEqual(tree.item_frames[self.second].cget('fg_color'), main.TreeItem.SELECTED_COLOR)
+
+    def test_drag_motion_coalesces_and_release_uses_latest_position(self):
+        tree = self.app.tree
+        tree.pressed_node = self.first
+        tree.drag_active = True
+        with patch.object(tree, 'update_drag') as update, patch.object(tree, 'finish_drag') as finish:
+            for _ in range(20):
+                tree.pointer_motion(self.first)
+            update.assert_not_called()
+            self.assertIsNotNone(tree._drag_job)
+            tree.pointer_release(self.first)
+            update.assert_called_once_with(self.first)
+            finish.assert_called_once_with(self.first)
+            self.assertIsNone(tree._drag_job)
+        tree.drag_active = False
+
+    def test_hit_cache_matches_rows_after_reordering(self):
+        tree = self.app.tree
+        for moved in (False, True):
+            if moved:
+                self.project.move(self.first, None, 'root_end')
+                tree.refresh()
+            self.app.update()
+            for node, frame in tree.item_frames.items():
+                self.assertIs(tree.get_node_under_mouse(frame.winfo_rooty() + 5), node)
+
     def test_grid_dimensions_and_selection(self):
         app = self.app
         for geometry in ('1000x650', '1200x750'):
