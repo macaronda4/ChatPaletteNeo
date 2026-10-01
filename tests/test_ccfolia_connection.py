@@ -24,6 +24,7 @@ class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.client = HeadlessRoom()
         self.client.page = MagicMock()
+        self.client.page.is_closed.return_value = False
         self.client.url = 'https://ccfolia.com/rooms/test'
         self.client.page.url = self.client.url
         self.api = MagicMock()
@@ -214,10 +215,27 @@ class WorkerTests(unittest.TestCase):
         result = worker.events.get(timeout=3)
         self.assertEqual(result.state, 'disconnected')
         self.assertTrue(result.login_available)
-        backend.close.assert_called_once()
+        backend.disconnect.assert_called_once()
         backend.connect.side_effect = None
         worker.submit('connect', 'https://ccfolia.com/rooms/test', None)
         self.assertEqual(worker.events.get(timeout=3).state, 'connected')
+
+    def test_login_without_room_reuses_session_until_shutdown(self):
+        backend = MagicMock()
+        backend.alive.return_value = True
+        worker = self.make_worker(backend)
+        worker.submit('login', 'user@example.invalid', 'test-password')
+        self.assertEqual(worker.events.get(timeout=3).state, 'disconnected')
+        backend.login.assert_called_once_with('user@example.invalid', 'test-password')
+        for _ in range(2):
+            worker.submit('connect', 'https://ccfolia.com/rooms/test', None)
+            self.assertEqual(worker.events.get(timeout=3).state, 'connected')
+            worker.submit('disconnect')
+            self.assertEqual(worker.events.get(timeout=3).state, 'disconnected')
+        backend.close.assert_not_called()
+        worker.close()
+        worker.thread.join(timeout=3)
+        backend.close.assert_called_once()
 
     def test_connection_loss(self):
         backend = MagicMock()
