@@ -400,6 +400,70 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(app.is_dirty())
         self.assertEqual(ProjectStore.load(self.project.path).data(), self.project.data())
 
+    def test_context_menu_actual_click_runs_once_and_preserves_focus(self):
+        app = self.app
+        app.editor._textbox.focus_force()
+        app.update()
+        called = []
+        app.context_popup = main.ModernContextMenu(
+            app, 'test', [('実行', lambda: called.append(True))], 100, 100)
+        app.update()
+        menu = app.context_popup
+        self.assertIs(menu.winfo_toplevel(), app)
+        self.assertIs(app.focus_get(), app.editor._textbox)
+        panel = next(child for child in menu.winfo_children()
+                     if isinstance(child, main.customtkinter.CTkFrame))
+        button = next(child for child in panel.winfo_children()
+                      if isinstance(child, main.customtkinter.CTkButton))
+        button._canvas.event_generate('<Enter>', x=5, y=5)
+        button._canvas.event_generate('<ButtonPress-1>', x=5, y=5)
+        self.assertTrue(menu.winfo_exists())
+        button._canvas.event_generate('<ButtonRelease-1>', x=5, y=5)
+        app.update()
+        self.assertEqual(called, [True])
+        self.assertFalse(menu.winfo_exists())
+
+    def test_context_menu_typing_and_escape_dismiss_without_losing_input(self):
+        app = self.app
+        app.editor._textbox.focus_force()
+        for key in ('a', 'Escape'):
+            app.context_menu(self.first, type('Event', (), {'x_root': 100, 'y_root': 100})())
+            app.update()
+            menu = app.context_popup
+            app.editor._textbox.event_generate(f'<KeyPress-{key}>')
+            app.update()
+            self.assertFalse(menu.winfo_exists())
+        self.assertEqual(app.editor.get('1.0', 'end-1c'), 'a')
+
+    def test_control_n_accepts_typing_without_click_and_blocks_nested_dialog(self):
+        app = self.app
+        failures = []
+        def type_name():
+            dialog = next(child for child in app.winfo_children()
+                          if isinstance(child, main.ModernNameDialog))
+            try:
+                self.assertIs(dialog.winfo_toplevel(), app)
+                self.assertIs(app.focus_get(), dialog.entry._entry)
+                dialog.entry._entry.event_generate('<Control-KeyPress-n>')
+                self.assertEqual(sum(isinstance(child, main.ModernNameDialog)
+                                     for child in app.winfo_children()), 1)
+                for key in 'typed':
+                    app.focus_get().event_generate(f'<KeyPress-{key}>')
+                self.assertEqual(dialog.entry.get(), 'typed')
+                app.focus_get().event_generate('<KeyPress-Return>')
+            except Exception as error:
+                failures.append(error)
+                dialog.destroy()
+        app.editor._textbox.focus_force()
+        app.update()
+        app.after(80, type_name)
+        app.editor._textbox.event_generate('<Control-KeyPress-n>')
+        app.update()
+        if failures:
+            raise failures[0]
+        self.assertEqual(app.current_node.text, 'typed.json')
+        self.assertIsNone(app.grab_current())
+
     def test_control_s_saves_current_file(self):
         app = self.app
         app.editor.insert('1.0', 'shortcut')
