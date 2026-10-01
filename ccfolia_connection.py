@@ -146,13 +146,20 @@ class HeadlessRoom:
             ) from None
 
     def connect(self, url, credentials=None):
-        print(url)
         self.url = room_url(url)
-        self._launch()
+        if not credentials:
+            if self.browser is None or not self.browser.is_connected():
+                if self.browser is not None:
+                    self.close()
+                self._launch()
+            if self.page is None or self.page.is_closed():
+                self.page = self.context.new_page()
+                self.page.set_default_timeout(8000)
+                self.page.set_default_navigation_timeout(25000)
         try:
             if credentials:
                 try:
-                    self._login(*credentials)
+                    self.login(*credentials)
                 except Exception:
                     raise AccessUnavailable(
                         "ログインできませんでした。入力内容・通信状態・認証方式を確認してください。"
@@ -175,9 +182,25 @@ class HeadlessRoom:
             self._select_main_tab()
         except (AccessUnavailable, ConnectionProblem):
             raise
-        except Exception as e:
-            print(e)
+        except Exception:
             raise ConnectionProblem("接続に失敗しました。通信状態やココフォリアの画面変更を確認してください。") from None
+
+    def login(self, email, password):
+        # Explicit account changes start a fresh session. Never persist cookies.
+        self.close()
+        self._launch()
+        try:
+            self._login(email, password)
+        except Exception:
+            self.close()
+            raise AccessUnavailable("ログインできませんでした。入力内容・認証方式を確認してください。") from None
+
+    def disconnect(self):
+        # Close the room page, retain the in-memory authenticated context.
+        if self.page is not None:
+            self.page.close()
+            self.page = None
+        self.url = None
 
     def alive(self):
         try:
@@ -271,41 +294,65 @@ class ConnectionWorker:
 
     def _run(self):
         backend = None
+        connected = False
         try:
             while not self.stopping.is_set():
                 try:
                     command, args = self.commands.get(timeout=1)
                 except Empty:
-                    if backend and not backend.alive():
+                    if connected and backend and not backend.alive():
                         backend.close()
                         backend = None
+                        connected = False
                         self.events.put(ConnectionEvent("disconnected", "接続が失われました。再接続してください。"))
                     continue
                 if self.stopping.is_set() or command == "close":
                     break
-                if command == "connect":
+                if command == "login":
                     try:
-                        if backend:
-                            backend.close()
-                        backend = self.backend_factory()
-                        backend.connect(*args)
-                        self.events.put(ConnectionEvent("connected", "接続済み"))
-                    except Exception as error:
+                        if backend is None:
+                            backend = self.backend_factory()
+                        backend.login(*args)
+                        self.events.put(ConnectionEvent("disconnected", "ログイン済み。ルームURLを入力して接続してください。"))
+                    except Exception:
                         if backend:
                             backend.close()
                         backend = None
+                        self.events.put(ConnectionEvent("disconnected", "ログインできませんでした。入力内容・認証方式を確認してください。", True))
+                    finally:
+                        connected = False
+                        args = ()
+                elif command == "connect":
+                    try:
+                        if backend is None:
+                            backend = self.backend_factory()
+                        backend.connect(*args)
+                        connected = True
+                        self.events.put(ConnectionEvent("connected", "接続済み"))
+                    except Exception as error:
+                        connected = False
+                        if backend:
+                            try:
+                                backend.disconnect()
+                            except Exception:
+                                backend.close()
+                                backend = None
                         message = str(error) if isinstance(error, (AccessUnavailable, ConnectionProblem)) else "接続に失敗しました。"
                         self.events.put(ConnectionEvent("disconnected", message, isinstance(error, AccessUnavailable)))
                     finally:
                         args = ()  # Do not retain the password while waiting for another command.
                 elif command == "disconnect":
                     if backend:
-                        backend.close()
-                    backend = None
+                        try:
+                            backend.disconnect()
+                        except Exception:
+                            backend.close()
+                            backend = None
+                    connected = False
                     self.events.put(ConnectionEvent("disconnected", "切断しました。"))
                 elif command == "send":
                     try:
-                        if backend is None:
+                        if backend is None or not connected:
                             raise ConnectionProblem("接続されていません。")
                         message = backend.send(*args)
                         self.events.put(ConnectionEvent("connected", message))

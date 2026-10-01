@@ -28,6 +28,16 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(loaded.data(), self.project.data())
         self.assertEqual(loaded.read_file(loaded.roots[0].children[0]), self.payload)
         self.assertEqual(loaded.data()[0]['children'][0]['data']['path'], 'シーン/台詞.json')
+        self.assertFalse(loaded.roots[0].expanded)
+
+    def test_create_checks_only_new_path(self):
+        self.project.save(self.path)
+        original = self.project.disk_path
+        with patch.object(self.project, 'disk_path', wraps=original) as paths, \
+                patch.object(self.project, 'validate', side_effect=AssertionError('full scan')):
+            node = self.project.create(self.folder, 'new', TreeNode.FILE)
+        self.assertTrue(all(call.args[0] is node for call in paths.call_args_list))
+        self.assertEqual(ProjectStore.load(self.path).data(), self.project.data())
 
     def test_rename_delete_and_legacy_tab_round_trip(self):
         self.project.save(self.path)
@@ -179,6 +189,8 @@ class EditorTests(unittest.TestCase):
         self.app.set_connection_state('disconnected', '未接続')
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.app.settings_path = Path(self.temp.name) / 'preferences.json'
+        self.app.last_login_email = ''
         self.project = ProjectStore()
         self.first = self.project.create(None, 'first', TreeNode.FILE)
         self.folder = self.project.create(None, 'folder', TreeNode.DIRECTORY)
@@ -366,6 +378,28 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(app.speaker.get(), '')
         self.assertEqual(app.send_tab.get(), '')
 
+    def test_context_menu_closes_on_editor_click(self):
+        app = self.app
+        app.context_menu(self.first, type('Event', (), {'x_root': 100, 'y_root': 100})())
+        app.update()
+        popup = app.context_popup
+        self.assertTrue(popup.winfo_exists())
+        app.editor._textbox.event_generate('<ButtonPress-1>', x=5, y=5)
+        app.update()
+        self.assertFalse(popup.winfo_exists())
+
+    def test_directory_rename_keeps_open_child(self):
+        app = self.app
+        app.file_clicked(self.second)
+        app.editor.insert('1.0', 'draft')
+        with patch('main.ModernNameDialog.ask', return_value='renamed-folder') as ask:
+            app.rename_file(self.folder)
+        ask.assert_called_once_with(app, TreeNode.DIRECTORY, initial_name='folder')
+        self.assertEqual(self.folder.text, 'renamed-folder')
+        self.assertTrue(self.project.disk_path(self.second).exists())
+        self.assertTrue(app.is_dirty())
+        self.assertEqual(ProjectStore.load(self.project.path).data(), self.project.data())
+
     def test_control_s_saves_current_file(self):
         app = self.app
         app.editor.insert('1.0', 'shortcut')
@@ -457,6 +491,21 @@ class EditorTests(unittest.TestCase):
             self.assertEqual(entry.cget('state'), 'normal')
             self.assertEqual(app.url_input.room_connect.cget('text'), '接続')
 
+    def test_login_without_url_remembers_email_only(self):
+        app = self.app
+        app.url_input.room_url.delete(0, 'end')
+        app.show_login()
+        app.login_email.insert(0, 'remember@example.invalid')
+        app.login_password.insert(0, 'secret-for-test')
+        with patch.object(app.connection, 'submit') as submit:
+            app.login_and_connect()
+        submit.assert_called_once_with('login', 'remember@example.invalid', 'secret-for-test')
+        self.assertEqual(json.loads(app.settings_path.read_text()), {'login_email': 'remember@example.invalid'})
+        app.set_connection_state('disconnected', '')
+        app.show_login()
+        self.assertEqual(app.login_email.get(), 'remember@example.invalid')
+        self.assertEqual(app.login_password.get(), '')
+
     def test_optional_login_is_inline_and_credentials_cleared(self):
         app = self.app
         app.url_input.room_url.delete(0, 'end')
@@ -506,6 +555,7 @@ class EditorTests(unittest.TestCase):
     def test_optional_login_invalid_url_shows_inline_error(self):
         app = self.app
         app.url_input.room_url.delete(0, 'end')
+        app.url_input.room_url.insert(0, 'https://example.com')
         app.login_button.invoke()
         app.login_email.insert(0, 'user@example.invalid')
         app.login_password.insert(0, 'test-only')
@@ -547,6 +597,7 @@ class EditorTests(unittest.TestCase):
 
         dialog = main.ModernNameDialog(app, TreeNode.FILE)
         app.update()
+        self.assertIs(app.focus_get(), dialog.entry._entry)
         dialog.entry.insert(0, '../invalid')
         dialog.submit()
         self.assertTrue(dialog.winfo_exists())

@@ -99,7 +99,7 @@ class ProjectStore:
 
     def data(self):
         def serialize(node):
-            result = node.to_dict()
+            result = {"text": node.text, "type": node.node_type}
             metadata = dict(node.data) if isinstance(node.data, dict) else {}
             if node.data is not None and not isinstance(node.data, dict):
                 metadata["legacy_data"] = node.data
@@ -117,6 +117,9 @@ class ProjectStore:
             raise ValueError("CPNのルートはツリーの配列である必要があります。")
         project = cls([TreeNode.from_dict(item) for item in data], path)
         project.validate()
+        for node in project.walk():
+            if node.is_directory:
+                node.expanded = False
         return project
 
     def read_file(self, node):
@@ -186,18 +189,38 @@ class ProjectStore:
             raise ValueError("ファイルの中に項目は作成できません。")
         node = TreeNode(name, node_type=kind, parent=parent)
         siblings = self.roots if parent is None else parent.children
+        key = name.casefold()
+        for sibling in siblings:
+            sibling_name = sibling.text
+            if sibling.is_file and not sibling_name.lower().endswith(".json"):
+                sibling_name += ".json"
+            if sibling_name.casefold() == key:
+                raise ValueError("同名の項目が既に存在します。")
         siblings.append(node)
         old_dirty = self.dirty
+        created_path = None
         try:
-            self.validate()
             if self.path and self.disk_path(node).exists():
                 raise FileExistsError("同名のファイルまたはディレクトリが既に存在します。")
             if node.is_file:
                 self.pending[node] = {"speaker": "", "text": "", "tab": "メイン"}
             self.dirty = True
             if self.path:
-                self.save()
+                destination = self.disk_path(node)
+                if node.is_directory:
+                    destination.mkdir()
+                else:
+                    atomic_json(destination, self.pending[node])
+                created_path = destination
+                atomic_json(self.path, self.data())
+                self.pending.pop(node, None)
+                self.dirty = False
         except Exception:
+            if created_path is not None:
+                if created_path.is_dir():
+                    created_path.rmdir()
+                else:
+                    created_path.unlink()
             siblings.remove(node)
             self.pending.pop(node, None)
             self.dirty = old_dirty
@@ -315,6 +338,7 @@ class ModernContextMenu(customtkinter.CTkToplevel):
 
     def __init__(self, master, title, items, x, y):
         super().__init__(master)
+        self._outside_bindings = []
         self.withdraw()
         self.overrideredirect(True)
         self.transient(master)
@@ -370,8 +394,18 @@ class ModernContextMenu(customtkinter.CTkToplevel):
         self.deiconify()
         self.lift()
         self.focus_force()
+        for sequence in ("<ButtonPress-1>", "<FocusIn>"):
+            callback = self._close_if_focus_left if sequence == "<FocusIn>" else lambda _event: self.destroy()
+            binding = master.bind(sequence, callback, add="+")
+            self._outside_bindings.append((sequence, binding))
         # 子ボタンへのフォーカス移動を待ってから、外側クリックで閉じる。
-        self.after(100, lambda: self.bind("<FocusOut>", self._close_if_focus_left))
+        self.bind("<FocusOut>", self._close_if_focus_left)
+
+    def destroy(self):
+        for sequence, binding in self._outside_bindings:
+            self.master.unbind(sequence, binding)
+        self._outside_bindings.clear()
+        super().destroy()
 
     def _run(self, command):
         self.destroy()
@@ -473,7 +507,9 @@ class ModernNameDialog(customtkinter.CTkToplevel):
         y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.grab_set()
-        self.entry.focus_set()
+        self.deiconify()
+        self.lift()
+        self.entry.focus_force()
 
     def submit(self, _event=None):
         name = self.entry.get().strip()
@@ -507,6 +543,15 @@ class App(customtkinter.CTk):
         self._connection_poll = None
         self._closing = False
         self.login_panel = None
+        config_root = Path(os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        self.settings_path = config_root / "ChatPaletteNeo" / "preferences.json"
+        self.last_login_email = ""
+        try:
+            preferences = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            if isinstance(preferences, dict) and isinstance(preferences.get("login_email"), str):
+                self.last_login_email = preferences["login_email"]
+        except (OSError, ValueError):
+            pass
         self.project = ProjectStore()
         self.current_node = None
         self.context_popup = None
@@ -806,7 +851,7 @@ class App(customtkinter.CTk):
         self.connection_label.configure(text=message)
         self.url_input.room_url.configure(state="normal" if state == "disconnected" else "disabled")
         labels = {"disconnected": "接続", "connecting": "接続中…", "connected": "切断",
-                  "sending": "切断", "disconnecting": "切断中…"}
+                  "sending": "切断", "disconnecting": "切断中…", "logging_in": "ログイン中…"}
         self.url_input.room_connect.configure(
             text=labels[state], state="normal" if state in ("disconnected", "connected") else "disabled"
         )
@@ -860,11 +905,12 @@ class App(customtkinter.CTk):
         self.login_panel.grid_columnconfigure(0, weight=1)
         customtkinter.CTkLabel(self.login_panel, text="ココフォリアへログイン（任意）", font=(FONT_TYPE, 18, "normal")).grid(row=0, column=0, padx=24, pady=(20, 8), sticky="w")
         customtkinter.CTkLabel(
-            self.login_panel, text="上部のルームURLへログインして接続します。\nメールアドレス認証のみ対応。SNS・追加認証には未対応です。\nパスワードは保存せず、切断するとログイン状態も破棄します。",
+            self.login_panel, text="URLが空欄でもログインできます。\nメールアドレス認証のみ対応。SNS・追加認証には未対応です。\nパスワードは保存せず、ログイン状態はアプリ終了まで保持します。",
             justify="left", wraplength=420,
         ).grid(row=1, column=0, padx=24, sticky="w")
         self.login_email = customtkinter.CTkEntry(self.login_panel, placeholder_text="メールアドレス", height=36)
         self.login_email.grid(row=2, column=0, padx=24, pady=(16, 8), sticky="ew")
+        self.login_email.insert(0, self.last_login_email)
         self.login_password = customtkinter.CTkEntry(self.login_panel, placeholder_text="パスワード", show="●", height=36)
         self.login_password.grid(row=3, column=0, padx=24, pady=8, sticky="ew")
         self.login_error = customtkinter.CTkLabel(self.login_panel, text="", text_color="#FF7B72")
@@ -872,7 +918,7 @@ class App(customtkinter.CTk):
         actions = customtkinter.CTkFrame(self.login_panel, fg_color="transparent")
         actions.grid(row=5, column=0, padx=24, pady=(0, 20), sticky="e")
         customtkinter.CTkButton(actions, text="キャンセル", width=100, command=self.hide_login).pack(side="left", padx=8)
-        customtkinter.CTkButton(actions, text="ログインして接続", width=150, command=self.login_and_connect).pack(side="left")
+        customtkinter.CTkButton(actions, text="ログイン", width=150, command=self.login_and_connect).pack(side="left")
         self.login_password.bind("<Return>", lambda _event: self.login_and_connect())
         self.login_email.focus_set()
 
@@ -890,7 +936,18 @@ class App(customtkinter.CTk):
         if not email or not password:
             self.login_error.configure(text="メールアドレスとパスワードを入力してください。")
             return
-        self.start_connection((email, password))
+        self.last_login_email = email
+        try:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json(self.settings_path, {"login_email": email})
+        except OSError:
+            pass  # Read-only settings must not prevent login.
+        if self.url_input.room_url.get().strip():
+            self.start_connection((email, password))
+        else:
+            self.hide_login()
+            self.set_connection_state("logging_in", "ログイン中…")
+            self.connection.submit("login", email, password)
 
     def save_project(self):
         path = None
@@ -977,6 +1034,8 @@ class App(customtkinter.CTk):
                 ("ファイル削除", lambda: self.delete_file(node)),
                 None,
             ]
+        elif node and node.is_directory:
+            items[0:0] = [("ディレクトリ名変更", lambda: self.rename_file(node)), None]
         if parent:
             items.extend([
                 None,
@@ -988,7 +1047,7 @@ class App(customtkinter.CTk):
         )
 
     def rename_file(self, node):
-        name = ModernNameDialog.ask(self, TreeNode.FILE, initial_name=node.text)
+        name = ModernNameDialog.ask(self, node.node_type, initial_name=node.text)
         if name is None:
             return
         try:
