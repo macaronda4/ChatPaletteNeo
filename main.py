@@ -331,17 +331,15 @@ class ProjectStore:
         return True
 
 
-class ModernContextMenu(customtkinter.CTkToplevel):
+class ModernContextMenu(customtkinter.CTkFrame):
     """CustomTkinterの外観に合わせた、軽量な右クリックメニュー。"""
 
     WIDTH = 230
 
     def __init__(self, master, title, items, x, y):
-        super().__init__(master)
-        self._outside_bindings = []
-        self.withdraw()
-        self.overrideredirect(True)
-        self.transient(master)
+        super().__init__(master, width=self.WIDTH, corner_radius=10)
+        self._bind_job = None
+        self._armed = False
         self.configure(fg_color=("#F5F6F8", "#202225"))
 
         panel = customtkinter.CTkFrame(
@@ -385,57 +383,57 @@ class ModernContextMenu(customtkinter.CTkToplevel):
             ).pack(fill="x", padx=7, pady=2)
 
         self.update_idletasks()
-        width = self.WIDTH
+        scale = self._get_widget_scaling()
+        width = self.WIDTH * scale
         height = self.winfo_reqheight()
-        x = min(max(0, x), self.winfo_screenwidth() - width)
-        y = min(max(0, y), self.winfo_screenheight() - height)
-        self.geometry(f"{width}x{height}+{x}+{y}")
-        self.bind("<Escape>", lambda _event: self.destroy())
-        self.deiconify()
+        x = min(max(0, x - master.winfo_rootx()), max(0, master.winfo_width() - width))
+        y = min(max(0, y - master.winfo_rooty()), max(0, master.winfo_height() - height))
+        self.pack_propagate(False)
+        self.configure(width=self.WIDTH, height=height / scale)
+        self.place(x=x / scale, y=y / scale)
         self.lift()
-        self.focus_force()
-        for sequence in ("<ButtonPress-1>", "<FocusIn>"):
-            callback = self._close_if_focus_left if sequence == "<FocusIn>" else lambda _event: self.destroy()
-            binding = master.bind(sequence, callback, add="+")
-            self._outside_bindings.append((sequence, binding))
-        # 子ボタンへのフォーカス移動を待ってから、外側クリックで閉じる。
-        self.bind("<FocusOut>", self._close_if_focus_left)
+        # Bind after the opening right-click has finished propagating.
+        self._bind_job = self.after_idle(self._bind_outside)
+
+    def _bind_outside(self):
+        self._bind_job = None
+        self._armed = True
+
+    def _outside_event(self, event):
+        if not self._armed:
+            return
+        widget = event.widget
+        while widget is not None:
+            if widget is self:
+                if getattr(event, "keysym", "") == "Escape":
+                    self.destroy()
+                return
+            widget = getattr(widget, "master", None)
+        self.destroy()
 
     def destroy(self):
-        for sequence, binding in self._outside_bindings:
-            self.master.unbind(sequence, binding)
-        self._outside_bindings.clear()
+        if self._bind_job is not None:
+            self.after_cancel(self._bind_job)
+            self._bind_job = None
         super().destroy()
 
     def _run(self, command):
         self.destroy()
         command()
 
-    def _close_if_focus_left(self, _event):
-        def check():
-            if not self.winfo_exists():
-                return
-            focused = self.focus_get()
-            if focused is None or focused.winfo_toplevel() is not self:
-                self.destroy()
-
-        self.after(20, check)
-
-
-class ModernNameDialog(customtkinter.CTkToplevel):
+class ModernNameDialog(customtkinter.CTkFrame):
     """ファイル／ディレクトリ名を入力するモーダルダイアログ。"""
 
     def __init__(self, master, kind, initial_name=None):
-        super().__init__(master)
+        super().__init__(master, width=420, height=250, corner_radius=12, border_width=1)
+        self._previous_focus = master.focus_get()
+        self._show_job = None
         self.result = None
         self.kind = kind
         label = "ファイル" if kind == TreeNode.FILE else "ディレクトリ"
 
         title = f"{label}名変更" if initial_name is not None else f"新規{label}"
-        self.title(title)
-        self.geometry("420x210")
-        self.resizable(False, False)
-        self.transient(master)
+        self.grid_propagate(False)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
@@ -495,21 +493,29 @@ class ModernNameDialog(customtkinter.CTkToplevel):
             command=self.submit,
         ).grid(row=0, column=1)
 
-        self.bind("<Return>", self.submit)
-        self.bind("<Escape>", lambda _event: self.destroy())
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        self.after_idle(self._show)
+        self.entry.bind("<Return>", self.submit)
+        self.entry.bind("<Escape>", lambda _event: self.destroy())
+        self.place(relx=0.5, rely=0.5, anchor="center")
+        self.lift()
+        self._show_job = self.after_idle(self._show)
 
     def _show(self):
+        self._show_job = None
         self.update_idletasks()
-        master = self.master
-        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.grab_set()
-        self.deiconify()
         self.lift()
         self.entry.focus_force()
+
+    def destroy(self):
+        if self._show_job is not None:
+            self.after_cancel(self._show_job)
+            self._show_job = None
+        if self.grab_current() is self:
+            self.grab_release()
+        previous = self._previous_focus
+        super().destroy()
+        if previous is not None and previous.winfo_exists():
+            previous.focus_set()
 
     def submit(self, _event=None):
         name = self.entry.get().strip()
@@ -631,6 +637,10 @@ class App(customtkinter.CTk):
         self.speaker.bind("<KeyRelease>", lambda event: self.update_status(), add="+")
         self.bind("<Control-s>", self.save_shortcut, add="+")
         self.bind("<Control-n>", self.new_file_shortcut, add="+")
+        # Keep these bindings for the app lifetime; removing callbacks during a
+        # nested modal wait can leave Tk executing a deleted Tcl command.
+        for sequence in ("<ButtonPress-1>", "<ButtonPress-3>", "<KeyPress>", "<FocusIn>"):
+            self.bind(sequence, self.dismiss_context_on_event, add="+")
         for widget, field in ((self.editor, "text"), (self.speaker, "speaker")):
             for sequence, redo in (("<Control-z>", False), ("<Control-Shift-Z>", True),
                                    ("<Control-Shift-z>", True), ("<Control-y>", True)):
@@ -816,7 +826,8 @@ class App(customtkinter.CTk):
 
     def save_shortcut(self, _event=None):
         """Ctrl+Sで、現在開いているファイルを保存する。"""
-        self.save_current()
+        if self.grab_current() is None:
+            self.save_current()
         return "break"
 
     def send(self):
@@ -841,7 +852,9 @@ class App(customtkinter.CTk):
             self.send()
 
     def new_file_shortcut(self, _event=None):
-        if not self._closing:
+        if not self._closing and self.grab_current() is None:
+            if self.context_popup is not None and self.context_popup.winfo_exists():
+                self.context_popup.destroy()
             parent = self.current_node.parent if self.current_node else None
             self.create_node(parent, TreeNode.FILE)
         return "break"
@@ -1017,6 +1030,10 @@ class App(customtkinter.CTk):
             return False
         self.update_status()
         return changed
+
+    def dismiss_context_on_event(self, event):
+        if self.context_popup is not None and self.context_popup.winfo_exists():
+            self.context_popup._outside_event(event)
 
     def context_menu(self, node, event):
         parent = node if node and node.is_directory else (node.parent if node else None)
